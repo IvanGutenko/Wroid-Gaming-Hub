@@ -41,9 +41,9 @@ const POLL_TIMEOUT_MS: i32 = 50;
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Classic left-leaning arrow cursor sprite, `X` = black outline, `o` = white
-/// fill, `.` = transparent. Drawn as its own `wl_surface` so UI cursor mode
-/// keeps a visible pointer even when the host compositor hides its sprite
-/// (e.g. gamescope `--hide-cursor-delay` in aim mode).
+/// fill, `.` = transparent. Blitted directly into the overlay surface's
+/// full-surface buffers so UI cursor mode keeps a visible pointer even when
+/// the host compositor hides its sprite.
 const CURSOR_ROWS: &[&str] = &[
     "X...........",
     "XX..........",
@@ -214,17 +214,22 @@ struct OverlayState {
     surface: Option<wl_surface::WlSurface>,
     layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
     pointer: Option<wl_pointer::WlPointer>,
-    buffer: Option<wl_buffer::WlBuffer>,
-    /// Kept alive so the compositor can map the shared-memory buffer.
-    _memfd: Option<File>,
-    cursor_buffers: [Option<wl_buffer::WlBuffer>; 2],
-    cursor_buffer_index: usize,
-    cursor_visible: bool,
-    cursor_x: i32,
-    cursor_y: i32,
+    /// Full-surface sprite buffers; the arrow is blitted into them at the
+    /// requested position because `wl_surface.attach` forbids nonzero
+    /// offsets at version >= 5, so the sprite cannot move via attach.
+    sprite_buffers: [Option<wl_buffer::WlBuffer>; 2],
+    /// Surface size the sprite buffers were created for; drawing is skipped
+    /// when the compositor reconfigures a different size.
+    sprite_buffer_size: Option<(i32, i32)>,
+    sprite_stride: i32,
+    /// Arrow tip currently blitted into each sprite buffer.
+    sprite_drawn: [Option<(i32, i32)>; 2],
+    sprite_index: usize,
+    sprite_pixels: Option<SpritePixels>,
     pending_cursor_visible: bool,
     pending_cursor_x: i32,
     pending_cursor_y: i32,
+    /// Kept alive so the compositor can map the shared-memory pool.
     _cursor_memfd: Option<File>,
     last_x: f64,
     last_y: f64,
@@ -234,19 +239,43 @@ struct OverlayState {
     closed: bool,
 }
 
-impl OverlayState {
-    /// Horizontal clamp for the cursor sprite: the configured surface width
-    /// when known, otherwise the sprite width (single-position clamp).
-    fn clamp_width(&self) -> i32 {
-        self.configured_size
-            .and_then(|(width, _)| i32::try_from(width).ok())
-            .unwrap_or(CURSOR_WIDTH)
+/// Shared-memory mapping of the sprite pool, writable from this thread.
+struct SpritePixels {
+    pointer: *mut u8,
+    length: usize,
+}
+
+impl SpritePixels {
+    fn map(memfd: &File, length: usize) -> io::Result<Self> {
+        let pointer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                memfd.as_raw_fd(),
+                0,
+            )
+        };
+        if pointer == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            pointer: pointer.cast::<u8>(),
+            length,
+        })
     }
 
-    fn clamp_height(&self) -> i32 {
-        self.configured_size
-            .and_then(|(_, height)| i32::try_from(height).ok())
-            .unwrap_or(CURSOR_HEIGHT)
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.pointer, self.length) }
+    }
+}
+
+impl Drop for SpritePixels {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.pointer.cast::<libc::c_void>(), self.length);
+        }
     }
 }
 
@@ -281,13 +310,12 @@ fn run_overlay(
         surface: None,
         layer_surface: None,
         pointer: None,
-        buffer: None,
-        _memfd: None,
-        cursor_buffers: [None, None],
-        cursor_buffer_index: 0,
-        cursor_visible: false,
-        cursor_x: 0,
-        cursor_y: 0,
+        sprite_buffers: [None, None],
+        sprite_buffer_size: None,
+        sprite_stride: 0,
+        sprite_drawn: [None, None],
+        sprite_index: 0,
+        sprite_pixels: None,
         pending_cursor_visible: false,
         pending_cursor_x: 0,
         pending_cursor_y: 0,
@@ -378,10 +406,19 @@ fn run_overlay(
         ));
     }
 
-    // Attach a tiny transparent buffer so the surface is mapped.
-    create_and_attach_buffer(&mut state, &event_queue.handle())?;
-    // Prepare the sprite buffers for the session-drawn virtual cursor.
-    create_cursor_buffers(&mut state, &event_queue.handle())?;
+    // Map the surface with the first (still fully transparent) sprite buffer
+    // and prepare both sprite buffers for the session-drawn virtual cursor.
+    create_sprite_buffers(&mut state, &event_queue.handle())?;
+    let (surface_width, surface_height) = state
+        .sprite_buffer_size
+        .expect("sprite buffers require a configured size");
+    let surface = state
+        .surface
+        .as_ref()
+        .expect("surface created before buffers");
+    surface.attach(state.sprite_buffers[0].as_ref(), 0, 0);
+    surface.damage(0, 0, surface_width, surface_height);
+    surface.commit();
     // Apply the initial input region.
     apply_input_region(&mut state, &event_queue.handle());
 
@@ -390,40 +427,6 @@ fn run_overlay(
     }
 
     event_loop(&mut event_queue, &mut state, &commands)
-}
-
-/// Create a 1x1 transparent ARGB8888 buffer via `wl_shm` + memfd and attach it.
-fn create_and_attach_buffer(
-    state: &mut OverlayState,
-    qh: &QueueHandle<OverlayState>,
-) -> io::Result<()> {
-    let shm = state
-        .shm
-        .clone()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "wl_shm not available"))?;
-    let surface = state
-        .surface
-        .clone()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "surface not created"))?;
-
-    let width: i32 = 1;
-    let height: i32 = 1;
-    let stride = width.checked_mul(4).expect("1 * 4 cannot overflow");
-    let size = stride
-        .checked_mul(height)
-        .expect("stride * 1 cannot overflow");
-
-    let memfd = create_memfd(b"wroid-cursor\0", size as usize)?;
-    let pool = shm.create_pool(memfd.as_fd(), size, qh, ());
-    let buffer = pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, qh, ());
-
-    surface.attach(Some(&buffer), 0, 0);
-    surface.damage_buffer(0, 0, width, height);
-    surface.commit();
-
-    state.buffer = Some(buffer);
-    state._memfd = Some(memfd);
-    Ok(())
 }
 
 /// Create an anonymous memfd of the given size.
@@ -443,120 +446,163 @@ fn create_memfd(name: &[u8], size: usize) -> io::Result<File> {
     Ok(file)
 }
 
-/// Build the cursor sprite buffers: two identical copies of the arrow bitmap
-/// sharing one shm pool. The sprite is attached to the main overlay surface
-/// at a per-move offset (the session-drawn virtual cursor); alternating the
-/// two copies defeats Gamescope's identical-buffer dedupe.
-fn create_cursor_buffers(
+/// Build the cursor sprite buffers: two full-surface ARGB8888 copies sharing
+/// one shm pool. Both start fully transparent (fresh memfd pages are
+/// zero-filled) and the arrow is blitted into whichever copy is committed
+/// next; alternating the two defeats Gamescope's identical-buffer dedupe.
+fn create_sprite_buffers(
     state: &mut OverlayState,
     qh: &QueueHandle<OverlayState>,
 ) -> io::Result<()> {
     let Some(shm) = state.shm.clone() else {
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "wl_shm not available",
+        ));
+    };
+    let Some((width, height)) = state.configured_size.and_then(|(width, height)| {
+        Some((i32::try_from(width).ok()?, i32::try_from(height).ok()?))
+    }) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "layer surface was not configured yet",
+        ));
     };
 
-    let stride = CURSOR_WIDTH.checked_mul(4).expect("cursor stride fits");
-    let sprite_size = stride
-        .checked_mul(CURSOR_HEIGHT)
-        .expect("cursor buffer size fits");
-    let pool_size = sprite_size.checked_mul(2).expect("cursor pool fits");
-
-    let mut pixels = Vec::with_capacity((sprite_size / 4) as usize);
-    for _ in 0..2 {
-        for row in CURSOR_ROWS {
-            for column in 0..CURSOR_WIDTH {
-                let cell = row
-                    .chars()
-                    .nth(column as usize)
-                    .filter(|c| *c == 'X' || *c == 'o')
-                    .map(|c| {
-                        if c == 'X' {
-                            CURSOR_OUTLINE
-                        } else {
-                            CURSOR_FILL
-                        }
-                    })
-                    .unwrap_or(CURSOR_TRANSPARENT);
-                pixels.extend_from_slice(&cell.to_ne_bytes());
-            }
-        }
-    }
+    let stride = width
+        .checked_mul(4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stride overflow"))?;
+    let frame = stride
+        .checked_mul(height)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer size overflow"))?;
+    let pool_size = frame
+        .checked_mul(2)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pool size overflow"))?;
 
     let memfd = create_memfd(b"wroid-cursor-sprite\0", pool_size as usize)?;
-    {
-        use std::io::Write as _;
-        let mut mapping = memfd.try_clone()?;
-        mapping.write_all(&pixels)?;
-        mapping.flush()?;
-    }
-
+    let pixels = SpritePixels::map(&memfd, pool_size as usize)?;
     let pool = shm.create_pool(memfd.as_fd(), pool_size, qh, ());
-    let first = pool.create_buffer(
-        0,
-        CURSOR_WIDTH,
-        CURSOR_HEIGHT,
-        stride,
-        wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
+    let first = pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, qh, ());
     let second = pool.create_buffer(
-        sprite_size,
-        CURSOR_WIDTH,
-        CURSOR_HEIGHT,
+        frame,
+        width,
+        height,
         stride,
         wl_shm::Format::Argb8888,
         qh,
         (),
     );
 
-    state.cursor_buffers = [Some(first), Some(second)];
+    state.sprite_buffers = [Some(first), Some(second)];
+    state.sprite_buffer_size = Some((width, height));
+    state.sprite_stride = stride;
+    state.sprite_drawn = [None, None];
+    state.sprite_index = 0;
+    state.sprite_pixels = Some(pixels);
     state._cursor_memfd = Some(memfd);
     Ok(())
 }
 
 /// Draw (or hide) the virtual cursor sprite on the main overlay surface.
+///
+/// The arrow is blitted into the next full-surface buffer at the requested
+/// position and committed with attach offset `(0, 0)`; `wl_surface.attach`
+/// has required zero offsets since version 5, so the sprite moves inside the
+/// buffer, not via the attach offset. Alternating buffers keeps every commit
+/// distinct for Gamescope's dedupe.
 fn draw_cursor(state: &mut OverlayState) {
     let Some(surface) = state.surface.clone() else {
         return;
     };
-    let old_rect = state.cursor_visible.then_some((
-        state.cursor_x,
-        state.cursor_y,
-        CURSOR_WIDTH,
-        CURSOR_HEIGHT,
-    ));
+    let Some((width, height)) = state.sprite_buffer_size else {
+        return;
+    };
+    let matches_configured = match state.configured_size {
+        Some((configured_width, configured_height)) => {
+            i32::try_from(configured_width) == Ok(width)
+                && i32::try_from(configured_height) == Ok(height)
+        }
+        None => false,
+    };
+    if !matches_configured {
+        // The compositor reconfigured a different size; the pool no longer
+        // matches the surface, so skip drawing rather than risk a protocol
+        // error.
+        return;
+    }
 
     let new_x = state
         .pending_cursor_x
-        .clamp(0, state.clamp_width().saturating_sub(CURSOR_WIDTH));
+        .clamp(0, width.saturating_sub(CURSOR_WIDTH));
     let new_y = state
         .pending_cursor_y
-        .clamp(0, state.clamp_height().saturating_sub(CURSOR_HEIGHT));
-    state.cursor_visible = state.pending_cursor_visible;
-    state.cursor_x = new_x;
-    state.cursor_y = new_y;
+        .clamp(0, height.saturating_sub(CURSOR_HEIGHT));
+    let drawn = state.pending_cursor_visible.then_some((new_x, new_y));
 
-    if state.cursor_visible {
-        state.cursor_buffer_index ^= 1;
-        let index = state.cursor_buffer_index;
-        if let Some(buffer) = state.cursor_buffers[index].as_ref() {
-            surface.attach(Some(buffer), new_x, new_y);
-            if let Some((x, y, w, h)) = old_rect {
-                surface.damage(x, y, w, h);
-            }
-            surface.damage(new_x, new_y, CURSOR_WIDTH, CURSOR_HEIGHT);
-            surface.commit();
+    state.sprite_index ^= 1;
+    let index = state.sprite_index;
+    let old_rect = state.sprite_drawn[index];
+    if old_rect == drawn {
+        // This buffer already shows exactly that; nothing to commit.
+        return;
+    }
+
+    if let Some(pixels) = state.sprite_pixels.as_mut() {
+        let bytes = pixels.as_mut_slice();
+        clear_sprite_rect(bytes, state.sprite_stride, old_rect);
+        if let Some((x, y)) = drawn {
+            blit_arrow(bytes, state.sprite_stride, x, y);
         }
-    } else if old_rect.is_some() {
-        // Re-attach the transparent 1x1 buffer so the surface stays mapped
-        // while nothing is drawn.
-        if let Some(buffer) = state.buffer.as_ref() {
-            surface.attach(Some(buffer), 0, 0);
-            if let Some((x, y, w, h)) = old_rect {
-                surface.damage(x, y, w, h);
+    }
+    state.sprite_drawn[index] = drawn;
+
+    if let Some(buffer) = state.sprite_buffers[index].as_ref() {
+        surface.attach(Some(buffer), 0, 0);
+        if let Some((x, y)) = old_rect {
+            surface.damage(x, y, CURSOR_WIDTH, CURSOR_HEIGHT);
+        }
+        if let Some((x, y)) = drawn {
+            surface.damage(x, y, CURSOR_WIDTH, CURSOR_HEIGHT);
+        }
+        surface.commit();
+    }
+}
+
+/// Erase the arrow at `rect` from the sprite pool bytes.
+fn clear_sprite_rect(bytes: &mut [u8], stride: i32, rect: Option<(i32, i32)>) {
+    let Some((x, y)) = rect else {
+        return;
+    };
+    for row in 0..CURSOR_HEIGHT {
+        let start = ((y + row) * stride + x * 4) as usize;
+        let end = start + CURSOR_WIDTH as usize * 4;
+        if end <= bytes.len() {
+            bytes[start..end].fill(0);
+        }
+    }
+}
+
+/// Blit the arrow bitmap with its tip at `(x, y)` into the sprite pool bytes.
+fn blit_arrow(bytes: &mut [u8], stride: i32, x: i32, y: i32) {
+    for (row_index, row) in CURSOR_ROWS.iter().enumerate() {
+        for column in 0..CURSOR_WIDTH {
+            let cell = row
+                .chars()
+                .nth(column as usize)
+                .filter(|c| *c == 'X' || *c == 'o')
+                .map(|c| {
+                    if c == 'X' {
+                        CURSOR_OUTLINE
+                    } else {
+                        CURSOR_FILL
+                    }
+                })
+                .unwrap_or(CURSOR_TRANSPARENT);
+            let start = ((y + row_index as i32) * stride + (x + column) * 4) as usize;
+            let end = start + 4;
+            if end <= bytes.len() {
+                bytes[start..end].copy_from_slice(&cell.to_ne_bytes());
             }
-            surface.commit();
         }
     }
 }
@@ -907,5 +953,30 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for OverlayState {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arrow_blits_and_clears_within_bounds() {
+        let width = 64;
+        let height = 64;
+        let stride = width * 4;
+        let mut bytes = vec![0_u8; (stride * height) as usize];
+        blit_arrow(&mut bytes, stride, 10, 20);
+        let pixel = |bytes: &[u8], x: i32, y: i32| {
+            let start = (y * stride + x * 4) as usize;
+            u32::from_ne_bytes(bytes[start..start + 4].try_into().unwrap())
+        };
+        assert_eq!(pixel(&bytes, 10, 20), CURSOR_OUTLINE);
+        assert_eq!(pixel(&bytes, 11, 22), CURSOR_FILL);
+        assert_eq!(pixel(&bytes, 30, 30), CURSOR_TRANSPARENT);
+
+        clear_sprite_rect(&mut bytes, stride, Some((10, 20)));
+        assert_eq!(pixel(&bytes, 10, 20), CURSOR_TRANSPARENT);
+        assert_eq!(pixel(&bytes, 11, 22), CURSOR_TRANSPARENT);
     }
 }

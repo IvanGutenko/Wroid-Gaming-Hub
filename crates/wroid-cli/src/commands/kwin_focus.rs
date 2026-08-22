@@ -202,8 +202,10 @@ fn handle_client_commands(
     let Some(stream) = client.as_mut() else {
         return Ok(());
     };
+    // Poll the client socket instead of arming a read timeout: a zero-length
+    // timeout is rejected by the kernel and used to kill the whole relay.
     stream
-        .set_read_timeout(Some(Duration::ZERO))
+        .set_nonblocking(true)
         .context("failed to configure focus client for warp requests")?;
     loop {
         let mut chunk = [0_u8; 256];

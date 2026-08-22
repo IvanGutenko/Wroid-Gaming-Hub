@@ -1054,6 +1054,58 @@ fn request_cursor_warp(cursor_warp: &mut Option<UnixStream>, request: &str) {
     }
 }
 
+/// Overlay handle that degrades instead of failing the session.
+///
+/// If the sprite thread dies mid-session the overlay is dropped from the
+/// loop with a single warning: Android clicks keep working through the
+/// virtual cursor (uinput injection is independent of the sprite), so a dead
+/// sprite must not abort gameplay or spam the log on every mouse batch.
+struct OverlayGuard<'a> {
+    overlay: Option<&'a crate::cursor_overlay::CursorOverlay>,
+    warned: bool,
+}
+
+impl<'a> OverlayGuard<'a> {
+    fn new(overlay: Option<&'a crate::cursor_overlay::CursorOverlay>) -> Self {
+        Self {
+            overlay,
+            warned: false,
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        if let Some(overlay) = self.overlay {
+            if let Err(error) = overlay.set_enabled(enabled) {
+                self.degrade(error);
+            }
+        }
+    }
+
+    fn set_cursor(&mut self, visible: bool, x: f64, y: f64) {
+        if let Some(overlay) = self.overlay {
+            if let Err(error) = overlay.set_cursor(visible, x, y) {
+                self.degrade(error);
+            }
+        }
+    }
+
+    fn degrade(&mut self, error: std::io::Error) {
+        self.overlay = None;
+        if !self.warned {
+            self.warned = true;
+            eprintln!(
+                "Cursor overlay stopped ({error}); the on-screen cursor sprite is unavailable, \
+                 but Android clicks and profile controls keep working. Restart the session to \
+                 restore the sprite."
+            );
+        }
+    }
+}
+
 /// Apply an input mode transition while the session is active (captured).
 ///
 /// Keyboard capture and the mouse grab stay on in both modes — the mouse
@@ -1066,7 +1118,7 @@ fn request_cursor_warp(cursor_warp: &mut Option<UnixStream>, request: &str) {
 fn apply_input_mode<I: TouchInjector>(
     runtime: &mut UnifiedRuntime<I>,
     input_readers: &InputReaderControls,
-    overlay: Option<&crate::cursor_overlay::CursorOverlay>,
+    overlay: &mut OverlayGuard<'_>,
     mode: InputMode,
     grab_allowed: bool,
     reactivate_toggle_aim: bool,
@@ -1076,12 +1128,8 @@ fn apply_input_mode<I: TouchInjector>(
     match mode {
         InputMode::Aim => {
             input_readers.set_mouse_mode(true, grab_allowed)?;
-            if let Some(overlay) = overlay {
-                overlay
-                    .set_enabled(false)
-                    .and_then(|()| overlay.set_cursor(false, 0.0, 0.0))
-                    .map_err(|error| io::Error::other(format!("cursor overlay: {error}")))?;
-            }
+            overlay.set_enabled(false);
+            overlay.set_cursor(false, 0.0, 0.0);
             runtime.restore_aim(reactivate_toggle_aim)?;
         }
         InputMode::Ui => {
@@ -1090,12 +1138,8 @@ fn apply_input_mode<I: TouchInjector>(
             // The virtual cursor consumes the deltas itself; keep forwarding
             // (and the grab) so the host cursor does not drift in parallel.
             input_readers.set_mouse_mode(true, grab_allowed)?;
-            if let Some(overlay) = overlay {
-                overlay
-                    .set_enabled(true)
-                    .and_then(|()| overlay.set_cursor(true, virtual_cursor.x, virtual_cursor.y))
-                    .map_err(|error| io::Error::other(format!("cursor overlay: {error}")))?;
-            }
+            overlay.set_enabled(true);
+            overlay.set_cursor(true, virtual_cursor.x, virtual_cursor.y);
         }
     }
     request_cursor_warp(cursor_warp, "warp corner");
@@ -1111,18 +1155,14 @@ fn apply_input_mode<I: TouchInjector>(
 fn release_input_to_os<I: TouchInjector>(
     runtime: &mut UnifiedRuntime<I>,
     input_readers: &InputReaderControls,
-    overlay: Option<&crate::cursor_overlay::CursorOverlay>,
+    overlay: &mut OverlayGuard<'_>,
     restore: (f64, f64),
     cursor_warp: &mut Option<UnixStream>,
 ) -> GameSessionResult<()> {
     input_readers.set_keyboard_capture(false)?;
     input_readers.set_mouse_mode(false, false)?;
-    if let Some(overlay) = overlay {
-        overlay
-            .set_enabled(false)
-            .and_then(|()| overlay.set_cursor(false, 0.0, 0.0))
-            .map_err(|error| io::Error::other(format!("cursor overlay: {error}")))?;
-    }
+    overlay.set_enabled(false);
+    overlay.set_cursor(false, 0.0, 0.0);
     request_cursor_warp(
         cursor_warp,
         &format!("warp {:.0} {:.0}", restore.0, restore.1),
@@ -1140,7 +1180,7 @@ fn run_event_loop<I: TouchInjector>(
     let trace_input = options.trace_input;
     let exit_after = options.exit_after;
     let grab_allowed = options.grab_allowed;
-    let overlay = options.overlay;
+    let mut overlay = OverlayGuard::new(options.overlay);
     let mut focus_protected = options.focus_protected;
     let mut waydroid_focused = options.focused;
     let mut input_active = options.focused;
@@ -1162,8 +1202,8 @@ fn run_event_loop<I: TouchInjector>(
     // active aim controller; when no aim is active but the profile only has
     // toggle-key aim (and an overlay exists to click the UI), the session sits
     // in UI cursor mode.
-    let desired_mode = |runtime: &UnifiedRuntime<I>| -> InputMode {
-        if runtime.aim_active() || !runtime.has_toggle_key_aim() || overlay.is_none() {
+    let desired_mode = |runtime: &UnifiedRuntime<I>, ui_available: bool| -> InputMode {
+        if runtime.aim_active() || !runtime.has_toggle_key_aim() || !ui_available {
             InputMode::Aim
         } else {
             InputMode::Ui
@@ -1176,7 +1216,7 @@ fn run_event_loop<I: TouchInjector>(
         apply_input_mode(
             runtime,
             input_readers,
-            overlay,
+            &mut overlay,
             InputMode::Ui,
             grab_allowed,
             false,
@@ -1209,7 +1249,7 @@ fn run_event_loop<I: TouchInjector>(
                                 apply_input_mode(
                                     runtime,
                                     input_readers,
-                                    overlay,
+                                    &mut overlay,
                                     mode,
                                     grab_allowed,
                                     toggle_aim_active_before_release,
@@ -1221,12 +1261,12 @@ fn run_event_loop<I: TouchInjector>(
                             }
                         } else if input_active {
                             input_active = false;
-                            mode = desired_mode(runtime);
+                            mode = desired_mode(runtime, overlay.is_available());
                             toggle_aim_active_before_release = runtime.aim_active();
                             release_input_to_os(
                                 runtime,
                                 input_readers,
-                                overlay,
+                                &mut overlay,
                                 (virtual_cursor.x, virtual_cursor.y),
                                 &mut cursor_warp,
                             )?;
@@ -1240,12 +1280,12 @@ fn run_event_loop<I: TouchInjector>(
                         control_pressed = false;
                         if input_active {
                             input_active = false;
-                            mode = desired_mode(runtime);
+                            mode = desired_mode(runtime, overlay.is_available());
                             toggle_aim_active_before_release = runtime.aim_active();
                             release_input_to_os(
                                 runtime,
                                 input_readers,
-                                overlay,
+                                &mut overlay,
                                 (virtual_cursor.x, virtual_cursor.y),
                                 &mut cursor_warp,
                             )?;
@@ -1312,12 +1352,12 @@ fn run_event_loop<I: TouchInjector>(
                             if input_active {
                                 manually_released = true;
                                 input_active = false;
-                                mode = desired_mode(runtime);
+                                mode = desired_mode(runtime, overlay.is_available());
                                 toggle_aim_active_before_release = runtime.aim_active();
                                 release_input_to_os(
                                     runtime,
                                     input_readers,
-                                    overlay,
+                                    &mut overlay,
                                     (virtual_cursor.x, virtual_cursor.y),
                                     &mut cursor_warp,
                                 )?;
@@ -1329,7 +1369,7 @@ fn run_event_loop<I: TouchInjector>(
                                 apply_input_mode(
                                     runtime,
                                     input_readers,
-                                    overlay,
+                                    &mut overlay,
                                     mode,
                                     grab_allowed,
                                     toggle_aim_active_before_release,
@@ -1372,12 +1412,12 @@ fn run_event_loop<I: TouchInjector>(
                 // Sync the input mode with aim state: pressing a toggle key
                 // flips between aim and UI cursor mode.
                 if input_active {
-                    let next_mode = desired_mode(runtime);
+                    let next_mode = desired_mode(runtime, overlay.is_available());
                     if next_mode != mode {
                         apply_input_mode(
                             runtime,
                             input_readers,
-                            overlay,
+                            &mut overlay,
                             next_mode,
                             grab_allowed,
                             true,
@@ -1449,13 +1489,7 @@ fn run_event_loop<I: TouchInjector>(
                         }
                     }
                     if sprite_dirty {
-                        if let Some(overlay) = overlay {
-                            if let Err(error) =
-                                overlay.set_cursor(true, virtual_cursor.x, virtual_cursor.y)
-                            {
-                                eprintln!("Cursor sprite update failed: {error}");
-                            }
-                        }
+                        overlay.set_cursor(true, virtual_cursor.x, virtual_cursor.y);
                     }
                     if submitted {
                         runtime.record_pipeline_latency(received_at.elapsed(), kernel_timestamp);
