@@ -199,16 +199,15 @@ pub fn run_game_session(mut options: GameSessionOptions) -> GameSessionResult<Ga
         );
     }
     let mut waydroid = DesktopWaydroidSession::start_presented(desktop_user, presentation)?;
-    let gamescope_wayland_display = waydroid.gamescope_wayland_display()?;
-    if let Some(display) = gamescope_wayland_display.as_deref() {
+    if let Some(display) = waydroid.gamescope_wayland_display()?.as_deref() {
         println!("Gamescope nested Wayland display: {display}.");
     }
 
     let session_result = (|| -> GameSessionResult<GameSessionReport> {
-        waydroid.wait_until_android_ready()?;
+        wait_for_android_ready_recovering(&mut waydroid)?;
         if waydroid.configure_resolution(options.width, options.height)? {
             waydroid.restart()?;
-            waydroid.wait_until_android_ready()?;
+            wait_for_android_ready_recovering(&mut waydroid)?;
         }
         waydroid.confirm_resolution(options.width, options.height)?;
         // getevent visibility is not delivery: make sure Android's
@@ -322,7 +321,10 @@ pub fn run_game_session(mut options: GameSessionOptions) -> GameSessionResult<Ga
 
         // Cursor overlay: a native Wayland layer surface inside nested
         // Gamescope that turns pointer input into Android touchscreen clicks.
-        // Its emit closure forwards overlay events into the event loop.
+        // Its emit closure forwards overlay events into the event loop. The
+        // display is re-read here because a boot-recovery or resolution
+        // restart replaced the gamescope instance and its display name.
+        let gamescope_wayland_display = waydroid.gamescope_wayland_display()?;
         let cursor_overlay = gamescope_wayland_display.as_deref().and_then(|display| {
             let cursor_sender = sender.clone();
             match crate::cursor_overlay::CursorOverlay::spawn(
@@ -432,6 +434,26 @@ pub fn run_game_session(mut options: GameSessionOptions) -> GameSessionResult<Ga
 enum SessionBridge {
     InProcess(AndroidInputAccess, InstalledWaydroidBridge),
     Broker(BridgeBrokerClient),
+}
+
+/// Wait for Android user readiness, recovering a stalled boot exactly once.
+///
+/// A fresh container start right after a desktop-session stop can wedge
+/// mid-boot with no readiness output and a live session child (observed as a
+/// silent stall after container init). A full stop and clean restart boots
+/// fine, so retry once before failing the whole game session.
+fn wait_for_android_ready_recovering(
+    waydroid: &mut DesktopWaydroidSession,
+) -> GameSessionResult<()> {
+    if let Err(first_error) = waydroid.wait_until_android_ready() {
+        eprintln!(
+            "Android did not become ready: {first_error}\nRestarting the Waydroid session once \
+             to recover a stalled Android boot…"
+        );
+        waydroid.restart()?;
+        waydroid.wait_until_android_ready()?;
+    }
+    Ok(())
 }
 
 impl SessionBridge {

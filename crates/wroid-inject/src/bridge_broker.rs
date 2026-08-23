@@ -198,9 +198,14 @@ impl BridgeBrokerClient {
     }
 
     pub fn finish(mut self, waydroid_stopped: bool) -> io::Result<()> {
-        if self.state != ClientState::Verified {
-            return Err(invalid_client_state("finish"));
+        if self.state == ClientState::Initial {
+            // The bridge was never opened; there is nothing to finish. An
+            // error here would bury the real session failure under a bogus
+            // cleanup message.
+            return Ok(());
         }
+        // Opened (verification never ran or failed) still owns a live helper
+        // with the bridge installed, so Finish must stay valid from it.
         self.exchange(
             BridgeRequest::Finish { waydroid_stopped },
             ExpectedResponse::Finished,
@@ -343,10 +348,13 @@ pub fn serve_bridge_broker(
                 state = ServerState::Verified;
                 state_deadline = None;
             }
-            (ServerState::Verified, BridgeRequest::Finish { waydroid_stopped }) => {
+            (
+                ServerState::Opened | ServerState::Verified,
+                BridgeRequest::Finish { waydroid_stopped },
+            ) => {
                 let result = helper
                     .take()
-                    .expect("verified broker owns a helper")
+                    .expect("opened broker owns a helper")
                     .finish(waydroid_stopped);
                 if let Err(error) = result {
                     let _ = write_error(&mut writer, "helper_finish_failed", &error.to_string());
@@ -609,6 +617,26 @@ mod tests {
         assert_eq!(
             *calls.lock().unwrap(),
             ["open:/dev/input/event42", "verify", "finish:true"]
+        );
+    }
+
+    #[test]
+    fn finish_without_open_is_a_no_op() {
+        let (client, broker, calls) = fixture();
+        client.finish(true).unwrap();
+        broker.join().unwrap().unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn finish_after_open_without_verify_still_cleans_up() {
+        let (mut client, broker, calls) = fixture();
+        client.open(Path::new("/dev/input/event42")).unwrap();
+        client.finish(false).unwrap();
+        broker.join().unwrap().unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["open:/dev/input/event42", "finish:false"]
         );
     }
 
