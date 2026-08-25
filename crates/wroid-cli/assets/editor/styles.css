@@ -385,6 +385,35 @@ kbd {
   background-color: rgba(82, 217, 255, 0.05);
 }
 
+.mouse-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.mouse-chip-row .field-label {
+  width: 100%;
+  margin: 0 0 2px;
+}
+
+.mouse-chip {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid rgba(82, 217, 255, 0.28);
+  background: #080c0c;
+  color: var(--cyan);
+  cursor: pointer;
+  font: 800 9px/1 var(--mono);
+  letter-spacing: 0.05em;
+}
+
+.mouse-chip:hover {
+  border-color: rgba(82, 217, 255, 0.62);
+  background-color: rgba(82, 217, 255, 0.05);
+}
+
 .key-capture-button.is-listening {
   border-color: var(--acid);
   background:

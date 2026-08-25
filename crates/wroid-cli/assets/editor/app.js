@@ -798,6 +798,12 @@
         input.key,
         "Activate the cell, then press a physical key or a mouse button (M1-M5). F12 remains reserved for input release.",
       );
+      html += `<div class="mouse-chip-row" id="inputMouseChips">
+        <span class="field-label">Or pick a mouse button</span>
+        ${[["left", "M1 · Left"], ["middle", "M3 · Middle"], ["right", "M2 · Right"], ["side", "M4 · Side back"], ["extra", "M5 · Side fwd"]]
+    .map(([value, label]) => `<button type="button" class="mouse-chip" data-mouse-button="${value}">${label}</button>`)
+    .join("")}
+      </div>`;
     } else if (input.kind === "key_cluster") {
       html += `<label class="field-label">Directional keys</label>
         <div class="key-cluster-grid">
@@ -994,6 +1000,17 @@
           binding.input.button = name;
         },
       });
+      document
+        .querySelectorAll("#inputMouseChips [data-mouse-button]")
+        .forEach((chip) => {
+          chip.addEventListener("click", () => {
+            mutate(() => {
+              binding.input = defaultInput("mouse_button");
+              binding.input.button = chip.dataset.mouseButton;
+            });
+            toast(`Bound to mouse ${chip.dataset.mouseButton.toUpperCase()}.`);
+          });
+        });
     } else if (binding.input.kind === "key_cluster") {
       wireKeyCapture("clusterUp", (value) => { binding.input.up = value; });
       wireKeyCapture("clusterLeft", (value) => { binding.input.left = value; });
