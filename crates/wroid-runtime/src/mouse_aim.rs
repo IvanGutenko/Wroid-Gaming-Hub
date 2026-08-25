@@ -376,6 +376,9 @@ pub struct MouseAimController {
     recenter_count: u64,
     last_reaffirm_at: Option<Duration>,
     accumulator: ScaleAccumulator,
+    /// Scaled touch travel accumulated by the current contact since its
+    /// down event; the relocation budget is measured against this.
+    travel_since_down: i64,
 }
 
 impl MouseAimController {
@@ -405,7 +408,19 @@ impl MouseAimController {
             recenter_count: 0,
             last_reaffirm_at: None,
             accumulator: ScaleAccumulator::default(),
+            travel_since_down: 0,
         })
+    }
+
+    /// Travel budget of one contact: a fraction of the smaller region
+    /// half-extent, so the contact can roam the whole clean region before it
+    /// is replaced.
+    fn travel_budget(&self) -> i64 {
+        let half_width = (self.aim.region.right - self.aim.region.left) / 2;
+        let half_height = (self.aim.region.bottom - self.aim.region.top) / 2;
+        (u64::from(half_width.min(half_height))
+            .saturating_mul(u64::from(self.settings.recenter_threshold_milli))
+            / 1_000) as i64
     }
 
     pub const fn aim(&self) -> &MouseAim {
@@ -441,6 +456,7 @@ impl MouseAimController {
         self.active_contact_id = Some(contact_id);
         self.next_contact_id = self.settings.alternate_contact_id;
         self.last_reaffirm_at = Some(now);
+        self.travel_since_down = 0;
         Ok(MouseAimUpdate::Activated)
     }
 
@@ -476,6 +492,11 @@ impl MouseAimController {
         }
 
         let (dx, dy) = self.scaled_delta(delta);
+        if dx == 0 && dy == 0 {
+            // The scaled delta vanished into the accumulator; nothing to
+            // apply and no travel to budget.
+            return Ok(MouseAimUpdate::Ignored);
+        }
         if let Some(pending) = &mut self.pending_recenter {
             trace_aim(format!(
                 "move during pending recenter: accumulate ({dx},{dy})"
@@ -496,25 +517,30 @@ impl MouseAimController {
             return Ok(MouseAimUpdate::Ignored);
         };
         let target = self.aim.region.clamp(offset_point(current, dx, dy));
-        if target == current {
-            trace_aim(format!(
-                "move ignored: clamped at edge, contact at ({},{})",
-                current.x, current.y
-            ));
-            return Ok(MouseAimUpdate::Ignored);
-        }
+        let clamped = target == current;
 
-        if self.past_recenter_threshold(target) {
-            return self.recenter(engine, contact_id, current, dx, dy, now);
+        // Relocate when the region edge swallowed the whole delta (the
+        // replacement lands at the origin, where later deltas apply again —
+        // without this the contact sticks to the edge and the camera dies
+        // for the rest of the swipe), or once the travel budget is spent.
+        // Both relocations continue from the new landing with the pending
+        // delta applied, so no rotation beyond the clamped event is lost.
+        if !clamped && self.travel_since_down < self.travel_budget() {
+            trace_aim(format!(
+                "move contact=({},{}) -> ({},{})",
+                current.x, current.y, target.x, target.y
+            ));
+            engine.move_contact(contact_id, target)?;
+            self.travel_since_down += dx.abs() + dy.abs();
+            self.last_reaffirm_at = Some(now);
+            return Ok(MouseAimUpdate::Moved);
         }
 
         trace_aim(format!(
-            "move contact=({},{}) -> ({},{})",
-            current.x, current.y, target.x, target.y
+            "relocate contact=({},{}) budget={} clamped={clamped} delta=({dx},{dy})",
+            current.x, current.y, self.travel_since_down
         ));
-        engine.move_contact(contact_id, target)?;
-        self.last_reaffirm_at = Some(now);
-        Ok(MouseAimUpdate::Moved)
+        self.relocate(engine, contact_id, current, dx, dy, now)
     }
 
     pub fn tick<I: TouchInjector>(
@@ -536,6 +562,7 @@ impl MouseAimController {
             self.pending_recenter = None;
             self.last_reaffirm_at = Some(now);
             self.apply_residual(engine, pending.contact_id, pending.dx, pending.dy)?;
+            self.travel_since_down = pending.dx.abs() + pending.dy.abs();
             return Ok(MouseAimUpdate::Recentered);
         }
 
@@ -576,6 +603,7 @@ impl MouseAimController {
         self.ads_active = false;
         self.last_reaffirm_at = None;
         self.accumulator.reset();
+        self.travel_since_down = 0;
         Ok(if changed {
             MouseAimUpdate::Deactivated
         } else {
@@ -601,6 +629,7 @@ impl MouseAimController {
         self.ads_active = false;
         self.last_reaffirm_at = None;
         self.accumulator.reset();
+        self.travel_since_down = 0;
         Ok(changed)
     }
 
@@ -616,19 +645,16 @@ impl MouseAimController {
         self.accumulator.scale(delta, numerator, denominator)
     }
 
-    fn past_recenter_threshold(&self, target: Point) -> bool {
-        let half_width = (self.aim.region.right - self.aim.region.left) / 2;
-        let half_height = (self.aim.region.bottom - self.aim.region.top) / 2;
-        let radius = u64::from(half_width.min(half_height))
-            .saturating_mul(u64::from(self.settings.recenter_threshold_milli))
-            / 1_000;
-        let dx = i64::from(target.x) - i64::from(self.aim.origin.x);
-        let dy = i64::from(target.y) - i64::from(self.aim.origin.y);
-        let distance_squared = dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)) as u64;
-        distance_squared > radius.saturating_mul(radius)
-    }
-
-    fn recenter<I: TouchInjector>(
+    /// Replace the active contact without losing rotation.
+    ///
+    /// `clamped` relocations land the replacement at the origin so the edge-
+    /// swallowed delta becomes applicable again; budget relocations land at
+    /// the exact position of the old contact, which keeps the game's
+    /// per-touch position samples continuous (zero rotation loss). Both
+    /// variants carry the pending delta as a same-frame move so the game
+    /// rebinds its look gesture immediately.
+    #[allow(clippy::too_many_arguments)]
+    fn relocate<I: TouchInjector>(
         &mut self,
         engine: &mut TouchEngine<I>,
         old_contact_id: ContactId,
@@ -640,12 +666,12 @@ impl MouseAimController {
         let new_contact_id = self.next_contact_id;
 
         if self.settings.recenter_gap.is_zero() {
-            // Swap contacts in ONE frame, and give the replacement contact a
-            // move event in that same frame: games bind their look gesture to
-            // a specific touch and only rebind when that touch moves, so a
-            // bare down would read as a one-frame look pause. The down at the
-            // origin plus the move to the residual offset lets the game
-            // rebind immediately while the old contact lifts.
+            // The replacement always lands at the origin: the one point of
+            // the region guaranteed clear of HUD buttons. Landing on the old
+            // contact's exact position stacks two touches on one spot for a
+            // frame, which games read as a broken gesture. The pending delta
+            // rides along as a same-frame move so the game rebinds its look
+            // gesture immediately.
             let landed = self.aim.region.clamp(offset_point(self.aim.origin, dx, dy));
             engine.submit(TouchFrame::new([
                 TouchEvent::new(new_contact_id, TouchPhase::Down, self.aim.origin),
@@ -655,6 +681,8 @@ impl MouseAimController {
             self.active_contact_id = Some(new_contact_id);
             self.next_contact_id = old_contact_id;
             self.last_reaffirm_at = Some(now);
+            self.travel_since_down = (i64::from(landed.x) - i64::from(self.aim.origin.x)).abs()
+                + (i64::from(landed.y) - i64::from(self.aim.origin.y)).abs();
         } else {
             engine.end_contact(old_contact_id)?;
             self.active_contact_id = None;
@@ -990,28 +1018,51 @@ mod tests {
         let mut engine = TouchEngine::new(RecordingInjector::default());
         controller.activate(&mut engine, Duration::ZERO).unwrap();
 
+        // Budget is 150 px of travel (half region height 300 x threshold
+        // 0.5): the first two moves stay on the same contact.
         assert_eq!(
             controller
                 .move_by(
                     &mut engine,
-                    MouseAimDelta::new(200, 0),
+                    MouseAimDelta::new(100, 0),
                     Duration::from_millis(1)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(100, 0),
+                    Duration::from_millis(2)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+
+        // The next move relocates: the replacement contact lands at the
+        // exact old position (zero rotation loss) and its same-frame move
+        // carries the pending delta, so the game rebinds immediately.
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(10, 0),
+                    Duration::from_millis(3)
                 )
                 .unwrap(),
             MouseAimUpdate::Recentered
         );
 
-        let recenter = &engine.injector().frames[1];
-        // Down of the replacement contact at the origin, its same-frame move
-        // to the residual offset (games rebind their look gesture on that
-        // move), and the lift of the old contact.
+        let recenter = &engine.injector().frames[3];
         assert_eq!(recenter.events().len(), 3);
         assert_eq!(recenter.events()[0].contact_id, ContactId::new(10));
         assert_eq!(recenter.events()[0].phase, TouchPhase::Down);
         assert_eq!(recenter.events()[0].position, Point { x: 960, y: 540 });
         assert_eq!(recenter.events()[1].contact_id, ContactId::new(10));
         assert_eq!(recenter.events()[1].phase, TouchPhase::Move);
-        assert_eq!(recenter.events()[1].position, Point { x: 1160, y: 540 });
+        assert_eq!(recenter.events()[1].position, Point { x: 970, y: 540 });
         assert_eq!(recenter.events()[2].contact_id, ContactId::new(9));
         assert_eq!(recenter.events()[2].phase, TouchPhase::Up);
         assert_eq!(controller.recenter_count(), 1);
@@ -1019,7 +1070,7 @@ mod tests {
         assert!(!engine.state().is_active(ContactId::new(9)));
         assert_eq!(
             engine.state().position(ContactId::new(10)),
-            Some(Point { x: 1160, y: 540 })
+            Some(Point { x: 970, y: 540 })
         );
     }
 
@@ -1028,31 +1079,42 @@ mod tests {
         let mut controller = controller(Duration::from_millis(10));
         let mut engine = TouchEngine::new(RecordingInjector::default());
         controller.activate(&mut engine, Duration::ZERO).unwrap();
-        controller
-            .move_by(
-                &mut engine,
-                MouseAimDelta::new(200, 0),
-                Duration::from_millis(1),
-            )
-            .unwrap();
-        controller
-            .move_by(
-                &mut engine,
-                MouseAimDelta::new(10, 0),
-                Duration::from_millis(5),
-            )
-            .unwrap();
+
+        // Budget 150: this move stays on the active contact.
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(250, 0),
+                    Duration::from_millis(1)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+        // Budget spent: with a recenter gap the old contact lifts now and
+        // the replacement presses after the gap, carrying the buffered
+        // delta.
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(10, 0),
+                    Duration::from_millis(5)
+                )
+                .unwrap(),
+            MouseAimUpdate::Recentered
+        );
 
         assert_eq!(engine.state().active_contact_count(), 0);
         assert_eq!(
             controller
-                .tick(&mut engine, Duration::from_millis(11))
+                .tick(&mut engine, Duration::from_millis(15))
                 .unwrap(),
             MouseAimUpdate::Recentered
         );
         assert_eq!(
             engine.state().position(ContactId::new(10)),
-            Some(Point { x: 1170, y: 540 })
+            Some(Point { x: 970, y: 540 })
         );
     }
 
