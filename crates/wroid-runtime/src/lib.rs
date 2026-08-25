@@ -229,39 +229,54 @@ impl TouchState {
             return Err(TouchStateError::EmptyFrame);
         }
 
-        for (index, event) in frame.events().iter().enumerate() {
-            if frame.events()[..index]
+        // Contacts touched earlier in this frame: a Down makes later Move
+        // events for the same contact valid (the aim recenter relies on a
+        // down+move pair landing in one report), every other repeat stays
+        // ambiguous and rejected.
+        let mut touched_in_frame: Vec<(ContactId, TouchPhase)> = Vec::new();
+        for event in frame.events().iter() {
+            let previous_phase = touched_in_frame
                 .iter()
-                .any(|previous| previous.contact_id == event.contact_id)
-            {
-                return Err(TouchStateError::DuplicateContactInFrame {
-                    contact_id: event.contact_id.get(),
-                });
+                .find(|(contact_id, _)| *contact_id == event.contact_id)
+                .map(|(_, phase)| *phase);
+            if let Some(previous_phase) = previous_phase {
+                if !matches!(
+                    (previous_phase, event.phase),
+                    (TouchPhase::Down, TouchPhase::Move)
+                ) {
+                    return Err(TouchStateError::DuplicateContactInFrame {
+                        contact_id: event.contact_id.get(),
+                    });
+                }
             }
 
+            let active_in_frame = previous_phase == Some(TouchPhase::Down);
             match event.phase {
                 TouchPhase::Down => {
-                    if self.active_contacts.contains_key(&event.contact_id) {
+                    if self.active_contacts.contains_key(&event.contact_id)
+                        || previous_phase.is_some()
+                    {
                         return Err(TouchStateError::ContactAlreadyActive {
                             contact_id: event.contact_id.get(),
                         });
                     }
                 }
                 TouchPhase::Move => {
-                    if !self.active_contacts.contains_key(&event.contact_id) {
+                    if !self.active_contacts.contains_key(&event.contact_id) && !active_in_frame {
                         return Err(TouchStateError::ContactNotActive {
                             contact_id: event.contact_id.get(),
                         });
                     }
                 }
                 TouchPhase::Up | TouchPhase::Cancel => {
-                    if !self.active_contacts.contains_key(&event.contact_id) {
+                    if !self.active_contacts.contains_key(&event.contact_id) && !active_in_frame {
                         return Err(TouchStateError::ContactNotActive {
                             contact_id: event.contact_id.get(),
                         });
                     }
                 }
             }
+            touched_in_frame.push((event.contact_id, event.phase));
         }
         Ok(())
     }
@@ -508,15 +523,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_events_for_same_contact_in_one_frame() {
+    fn allows_down_move_pair_and_rejects_ambiguous_repeats_in_one_frame() {
         let mut engine = TouchEngine::new(RecordingInjector::default());
         let contact = ContactId::new(3);
-        let frame = TouchFrame::new([
-            TouchEvent::new(contact, TouchPhase::Down, point(1, 1)),
-            TouchEvent::new(contact, TouchPhase::Move, point(2, 2)),
-        ]);
+        // Down followed by Move for the same contact is the aim recenter
+        // pattern: valid, and the state lands on the moved position.
+        engine
+            .submit(TouchFrame::new([
+                TouchEvent::new(contact, TouchPhase::Down, point(1, 1)),
+                TouchEvent::new(contact, TouchPhase::Move, point(2, 2)),
+            ]))
+            .unwrap();
+        assert_eq!(engine.state().position(contact), Some(point(2, 2)));
 
-        let error = engine.submit(frame).unwrap_err();
+        // A second Move for the same contact inside one frame stays
+        // ambiguous and rejected.
+        let error = engine
+            .submit(TouchFrame::new([
+                TouchEvent::new(contact, TouchPhase::Move, point(3, 3)),
+                TouchEvent::new(contact, TouchPhase::Move, point(4, 4)),
+            ]))
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -524,7 +551,7 @@ mod tests {
                 contact_id: 3
             })
         ));
-        assert!(!engine.state().is_active(contact));
-        assert!(engine.injector().frames.is_empty());
+        assert_eq!(engine.state().position(contact), Some(point(2, 2)));
+        assert!(engine.injector().frames.len() == 1);
     }
 }

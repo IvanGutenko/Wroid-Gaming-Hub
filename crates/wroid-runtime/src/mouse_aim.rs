@@ -640,13 +640,16 @@ impl MouseAimController {
         let new_contact_id = self.next_contact_id;
 
         if self.settings.recenter_gap.is_zero() {
-            // Land the replacement contact directly at the residual offset
-            // inside the SAME frame as the swap. A separate follow-up move
-            // frame reads as a one-frame look pause in games that reset
-            // their gesture state on every new touch.
+            // Swap contacts in ONE frame, and give the replacement contact a
+            // move event in that same frame: games bind their look gesture to
+            // a specific touch and only rebind when that touch moves, so a
+            // bare down would read as a one-frame look pause. The down at the
+            // origin plus the move to the residual offset lets the game
+            // rebind immediately while the old contact lifts.
             let landed = self.aim.region.clamp(offset_point(self.aim.origin, dx, dy));
             engine.submit(TouchFrame::new([
-                TouchEvent::new(new_contact_id, TouchPhase::Down, landed),
+                TouchEvent::new(new_contact_id, TouchPhase::Down, self.aim.origin),
+                TouchEvent::new(new_contact_id, TouchPhase::Move, landed),
                 TouchEvent::new(old_contact_id, TouchPhase::Up, old_position),
             ]))?;
             self.active_contact_id = Some(new_contact_id);
@@ -999,14 +1002,25 @@ mod tests {
         );
 
         let recenter = &engine.injector().frames[1];
-        assert_eq!(recenter.events().len(), 2);
+        // Down of the replacement contact at the origin, its same-frame move
+        // to the residual offset (games rebind their look gesture on that
+        // move), and the lift of the old contact.
+        assert_eq!(recenter.events().len(), 3);
         assert_eq!(recenter.events()[0].contact_id, ContactId::new(10));
         assert_eq!(recenter.events()[0].phase, TouchPhase::Down);
-        assert_eq!(recenter.events()[1].contact_id, ContactId::new(9));
-        assert_eq!(recenter.events()[1].phase, TouchPhase::Up);
+        assert_eq!(recenter.events()[0].position, Point { x: 960, y: 540 });
+        assert_eq!(recenter.events()[1].contact_id, ContactId::new(10));
+        assert_eq!(recenter.events()[1].phase, TouchPhase::Move);
+        assert_eq!(recenter.events()[1].position, Point { x: 1160, y: 540 });
+        assert_eq!(recenter.events()[2].contact_id, ContactId::new(9));
+        assert_eq!(recenter.events()[2].phase, TouchPhase::Up);
         assert_eq!(controller.recenter_count(), 1);
         assert!(engine.state().is_active(ContactId::new(10)));
         assert!(!engine.state().is_active(ContactId::new(9)));
+        assert_eq!(
+            engine.state().position(ContactId::new(10)),
+            Some(Point { x: 1160, y: 540 })
+        );
     }
 
     #[test]
