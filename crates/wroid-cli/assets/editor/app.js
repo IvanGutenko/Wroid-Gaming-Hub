@@ -794,9 +794,9 @@
     if (input.kind === "key") {
       html += keyCaptureField(
         "inputKey",
-        "Key",
+        "Key or mouse button",
         input.key,
-        "Activate the cell, then press the physical key. F12 remains reserved for input release.",
+        "Activate the cell, then press a physical key or a mouse button (M1-M5). F12 remains reserved for input release.",
       );
     } else if (input.kind === "key_cluster") {
       html += `<label class="field-label">Directional keys</label>
@@ -896,6 +896,8 @@
     if (!capture) return;
     window.removeEventListener("keydown", capture.onKeyDown, true);
     window.removeEventListener("pointerdown", capture.onPointerDown, true);
+    window.removeEventListener("mousedown", capture.onMouseDown, true);
+    window.removeEventListener("contextmenu", capture.onContextMenu, true);
     if (capture.button.isConnected) {
       capture.button.innerHTML = capture.originalHtml;
       capture.button.classList.remove("is-listening");
@@ -904,7 +906,10 @@
     state.keyCapture = null;
   }
 
-  function wireKeyCapture(id, setter, { allowEmpty = false } = {}) {
+  // Browser MouseEvent.button order mapped to profile button names.
+  const MOUSE_BUTTON_NAMES = Object.freeze(["left", "middle", "right", "side", "extra"]);
+
+  function wireKeyCapture(id, setter, { allowEmpty = false, onMouseButton = null } = {}) {
     const button = document.querySelector(`#${id}`);
     if (!button) return;
     button.addEventListener("click", (event) => {
@@ -915,6 +920,10 @@
         keyEvent.preventDefault();
         keyEvent.stopImmediatePropagation();
         if (keyEvent.repeat) return;
+        if (keyEvent.key === "Escape") {
+          disarmKeyCapture();
+          return;
+        }
         const clearsBinding =
           allowEmpty && (keyEvent.key === "Backspace" || keyEvent.key === "Delete");
         const key = clearsBinding ? null : browserKeyName(keyEvent.key);
@@ -925,15 +934,30 @@
         disarmKeyCapture();
         mutate(() => setter(key));
       };
-      const onPointerDown = (pointerEvent) => {
-        if (!button.contains(pointerEvent.target)) disarmKeyCapture();
+      const onMouseDown = (mouseEvent) => {
+        mouseEvent.preventDefault();
+        mouseEvent.stopImmediatePropagation();
+        const buttonName = MOUSE_BUTTON_NAMES[mouseEvent.button];
+        if (!buttonName || !onMouseButton) return;
+        disarmKeyCapture();
+        mutate(() => onMouseButton(buttonName));
       };
-      state.keyCapture = { button, originalHtml, onKeyDown, onPointerDown };
+      const onPointerDown = (pointerEvent) => {
+        // Mouse-button listeners own outside clicks while capturing; the
+        // plain keyboard fields keep the click-away-to-cancel behavior.
+        if (!onMouseButton && !button.contains(pointerEvent.target)) disarmKeyCapture();
+      };
+      const onContextMenu = (contextEvent) => {
+        contextEvent.preventDefault();
+      };
+      state.keyCapture = { button, originalHtml, onKeyDown, onPointerDown, onMouseDown, onContextMenu };
       button.classList.add("is-listening");
       button.setAttribute("aria-pressed", "true");
-      button.innerHTML = "<strong>PRESS KEY</strong><small>LISTENING</small>";
+      button.innerHTML = "<strong>PRESS KEY OR MOUSE</strong><small>LISTENING · ESC CANCELS</small>";
       window.addEventListener("keydown", onKeyDown, true);
       window.addEventListener("pointerdown", onPointerDown, true);
+      window.addEventListener("mousedown", onMouseDown, true);
+      window.addEventListener("contextmenu", onContextMenu, true);
     });
   }
 
@@ -964,7 +988,12 @@
       }
     });
     if (binding.input.kind === "key") {
-      wireKeyCapture("inputKey", (value) => { binding.input.key = value; });
+      wireKeyCapture("inputKey", (value) => { binding.input.key = value; }, {
+        onMouseButton: (name) => {
+          binding.input = defaultInput("mouse_button");
+          binding.input.button = name;
+        },
+      });
     } else if (binding.input.kind === "key_cluster") {
       wireKeyCapture("clusterUp", (value) => { binding.input.up = value; });
       wireKeyCapture("clusterLeft", (value) => { binding.input.left = value; });
