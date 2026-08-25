@@ -116,7 +116,7 @@
       }
     },
     {
-      "name": "weapon-1-wheel",
+      "name": "weapon-1-primary",
       "input": {
         "kind": "key",
         "key": "1"
@@ -124,15 +124,15 @@
       "action": {
         "kind": "radial_select",
         "center": {
-          "x": 0.91,
-          "y": 0.14
+          "x": 0.87,
+          "y": 0.33
         },
         "distance": 0.07,
-        "direction": "left"
+        "direction": "down"
       }
     },
     {
-      "name": "weapon-2-wheel",
+      "name": "weapon-2-knife",
       "input": {
         "kind": "key",
         "key": "2"
@@ -140,11 +140,11 @@
       "action": {
         "kind": "radial_select",
         "center": {
-          "x": 0.91,
-          "y": 0.14
+          "x": 0.87,
+          "y": 0.33
         },
         "distance": 0.07,
-        "direction": "down"
+        "direction": "left"
       }
     },
     {
@@ -162,7 +162,7 @@
       }
     },
     {
-      "name": "weapon-3-wheel",
+      "name": "weapon-3-pistol",
       "input": {
         "kind": "key",
         "key": "3"
@@ -170,15 +170,15 @@
       "action": {
         "kind": "radial_select",
         "center": {
-          "x": 0.85,
-          "y": 0.15
+          "x": 0.87,
+          "y": 0.33
         },
         "distance": 0.07,
-        "direction": "left"
+        "direction": "right"
       }
     },
     {
-      "name": "weapon-4-wheel",
+      "name": "weapon-4-grenade",
       "input": {
         "kind": "key",
         "key": "4"
@@ -186,11 +186,11 @@
       "action": {
         "kind": "radial_select",
         "center": {
-          "x": 0.85,
-          "y": 0.15
+          "x": 0.87,
+          "y": 0.33
         },
         "distance": 0.07,
-        "direction": "down"
+        "direction": "up"
       }
     }
   ]

@@ -1737,6 +1737,7 @@ struct UnifiedRuntime<I: TouchInjector> {
     aim_controllers: Vec<Option<MouseAimController>>,
     aim_toggle_keys: Vec<Option<HostKeyName>>,
     last_joystick_frame: Vec<Option<Duration>>,
+    pending_radials: Vec<PendingRadial>,
     active_layers: u64,
     held_keys: ModifierMask,
     held_modifiers: ModifierMask,
@@ -1832,6 +1833,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             aim_controllers,
             aim_toggle_keys,
             last_joystick_frame: vec![None; control_count],
+            pending_radials: Vec::new(),
             active_layers: 0,
             held_keys: ModifierMask::EMPTY,
             held_modifiers: ModifierMask::EMPTY,
@@ -2398,14 +2400,21 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                         &self.selected_input_layers,
                     ) =>
                 {
-                    radial_select_binding(
+                    let contact_id = point_contact(self.point_contacts[index])?;
+                    radial_down_phase(
                         &mut self.engine,
-                        point_contact(self.point_contacts[index])?,
+                        contact_id,
                         &control.name,
                         *center,
-                        *target,
                         self.trace_input,
                     )?;
+                    self.pending_radials.push(PendingRadial {
+                        contact_id,
+                        binding_name: control.name.clone(),
+                        target: *target,
+                        phase: RadialPhase::Move,
+                        due_at: now.saturating_add(RADIAL_DOWN_DWELL),
+                    });
                     submitted = true;
                 }
                 (
@@ -2531,6 +2540,9 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         for controller in self.aim_controllers.iter_mut().flatten() {
             controller.tick(&mut self.engine, now)?;
         }
+        if !self.pending_radials.is_empty() {
+            self.advance_pending_radials(now)?;
+        }
         for (index, control) in self.plan.controls.iter().enumerate() {
             let RuntimeControlAction::VirtualJoystick {
                 joystick,
@@ -2552,6 +2564,78 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             self.last_joystick_frame[index] = Some(now);
         }
         Ok(())
+    }
+
+    fn advance_pending_radials(&mut self, now: Duration) -> GameSessionResult<()> {
+        let mut error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        let mut index = 0;
+        while index < self.pending_radials.len() {
+            let pending = &self.pending_radials[index];
+            if now < pending.due_at {
+                index += 1;
+                continue;
+            }
+            if !self.engine.state().is_active(pending.contact_id) {
+                // The contact died (suspend, cancel): drop the schedule.
+                self.pending_radials.remove(index);
+                continue;
+            }
+            let PendingRadial {
+                contact_id,
+                binding_name,
+                target,
+                phase,
+                ..
+            } = pending;
+            let (contact_id, target, phase) = (*contact_id, *target, *phase);
+            let next_phase = match phase {
+                RadialPhase::Move => {
+                    if let Err(failure) = self.engine.move_contact(contact_id, target) {
+                        error = Some(failure.into());
+                        break;
+                    }
+                    if self.trace_input {
+                        println!(
+                            "[trace] runtime radial binding={binding_name} contact={} move=({},{})",
+                            contact_id.get(),
+                            target.x,
+                            target.y
+                        );
+                    }
+                    Some((RadialPhase::Release, now.saturating_add(RADIAL_MOVE_DWELL)))
+                }
+                RadialPhase::Release => {
+                    if let Err(failure) = self.engine.end_contact(contact_id) {
+                        error = Some(failure.into());
+                        break;
+                    }
+                    if self.trace_input {
+                        println!(
+                            "[trace] runtime radial binding={binding_name} contact={} up=({},{})",
+                            contact_id.get(),
+                            target.x,
+                            target.y
+                        );
+                    }
+                    None
+                }
+            };
+            match next_phase {
+                Some((phase, due_at)) => {
+                    let pending = &mut self.pending_radials[index];
+                    pending.phase = phase;
+                    pending.due_at = due_at;
+                    index += 1;
+                }
+                None => {
+                    self.pending_radials.remove(index);
+                }
+            }
+        }
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn suspend(&mut self) -> GameSessionResult<()> {
@@ -2585,6 +2669,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         self.desired_bindings.fill(false);
         self.selected_input_layers.fill(None);
         self.last_joystick_frame.fill(None);
+        self.pending_radials.clear();
         if self.trace_input {
             println!(
                 "[trace] runtime suspend active_before={} cancel_frame_submitted={cancelled}",
@@ -2651,12 +2736,33 @@ fn tap_binding<I: TouchInjector>(
     Ok(())
 }
 
-fn radial_select_binding<I: TouchInjector>(
+/// How long the wheel-open touch rests at the center before swiping, and how
+/// long the swipe holds before release. Games coalesce same-instant
+/// down/move/up reports into a plain tap, so each radial phase needs real
+/// time between frames for the sector selection to register.
+const RADIAL_DOWN_DWELL: Duration = Duration::from_millis(60);
+const RADIAL_MOVE_DWELL: Duration = Duration::from_millis(40);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadialPhase {
+    Move,
+    Release,
+}
+
+#[derive(Debug)]
+struct PendingRadial {
+    contact_id: ContactId,
+    binding_name: String,
+    target: Point,
+    phase: RadialPhase,
+    due_at: Duration,
+}
+
+fn radial_down_phase<I: TouchInjector>(
     engine: &mut TouchEngine<I>,
     contact_id: ContactId,
     binding: &str,
     center: Point,
-    target: Point,
     trace_input: bool,
 ) -> GameSessionResult<()> {
     engine.submit(TouchFrame::single(TouchEvent::new(
@@ -2664,27 +2770,20 @@ fn radial_select_binding<I: TouchInjector>(
         TouchPhase::Down,
         center,
     )))?;
-    engine.submit(TouchFrame::single(TouchEvent::new(
-        contact_id,
-        TouchPhase::Move,
-        target,
-    )))?;
-    engine.submit(TouchFrame::single(TouchEvent::new(
-        contact_id,
-        TouchPhase::Up,
-        target,
-    )))?;
     if trace_input {
         println!(
-            "[trace] runtime radial binding={binding} contact={} center=({},{}) target=({},{})",
+            "[trace] runtime radial binding={binding} contact={} down=({},{}) dwell_ms={}",
             contact_id.get(),
             center.x,
             center.y,
-            target.x,
-            target.y
+            radial_down_dwell_ms(),
         );
     }
     Ok(())
+}
+
+fn radial_down_dwell_ms() -> u64 {
+    RADIAL_DOWN_DWELL.as_millis() as u64
 }
 
 fn set_hold_binding<I: TouchInjector>(
@@ -5070,5 +5169,71 @@ mod tests {
         assert!(kernel_event_age(recent).is_some_and(|age| age >= Duration::from_millis(5)));
         assert!(kernel_event_age(SystemTime::UNIX_EPOCH).is_none());
         assert!(kernel_event_age(SystemTime::now() + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn radial_select_sweeps_through_timed_phases() {
+        let mut runtime = test_runtime(
+            vec![],
+            vec![BindingV2 {
+                name: "wheel".to_owned(),
+                layer: None,
+                modifier: None,
+                input: InputV2::Key {
+                    key: "1".to_owned(),
+                },
+                action: ActionV2::RadialSelect {
+                    center: NormalizedPoint { x: 0.5, y: 0.5 },
+                    distance: 0.07,
+                    direction: wroid_core::profile_v2::RadialDirection::Down,
+                },
+            }],
+        );
+
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::Num1,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+
+        // Only the wheel-open touch so far; the swipe is scheduled.
+        assert_eq!(runtime.engine.injector().frames.len(), 1);
+        assert_eq!(runtime.pending_radials.len(), 1);
+        assert_eq!(runtime.engine.state().active_contact_count(), 1);
+
+        // Before the dwell elapses nothing advances.
+        runtime
+            .advance_pending_radials(Duration::from_millis(0))
+            .unwrap();
+        assert_eq!(runtime.engine.injector().frames.len(), 1);
+
+        // After the down dwell the contact swipes to the sector.
+        let move_at = RADIAL_DOWN_DWELL + Duration::from_millis(1);
+        runtime.advance_pending_radials(move_at).unwrap();
+        assert_eq!(runtime.engine.injector().frames.len(), 2);
+        assert_eq!(runtime.engine.state().active_contact_count(), 1);
+
+        // Still holding before the move dwell.
+        runtime
+            .advance_pending_radials(move_at + Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(runtime.engine.injector().frames.len(), 2);
+
+        // Then the release completes the gesture.
+        let release_at = move_at + RADIAL_MOVE_DWELL + Duration::from_millis(1);
+        runtime.advance_pending_radials(release_at).unwrap();
+        assert_eq!(runtime.engine.injector().frames.len(), 3);
+        assert!(runtime.pending_radials.is_empty());
+        assert_eq!(runtime.engine.state().active_contact_count(), 0);
+
+        let frames = &runtime.engine.injector().frames;
+        assert_eq!(frames[0].events()[0].phase, TouchPhase::Down);
+        assert_eq!(frames[0].events()[0].position, Point { x: 500, y: 500 });
+        assert_eq!(frames[1].events()[0].phase, TouchPhase::Move);
+        // distance 0.07 * min(1000,1000) = 70px straight down.
+        assert_eq!(frames[1].events()[0].position, Point { x: 500, y: 570 });
+        assert_eq!(frames[2].events()[0].phase, TouchPhase::Up);
+        runtime.stop().unwrap();
     }
 }
