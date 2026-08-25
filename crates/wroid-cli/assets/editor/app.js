@@ -1178,7 +1178,10 @@
     elements.redoButton.disabled = state.future.length === 0;
     elements.restoreButton.disabled =
       state.saving || state.launchingLiveTest || !state.backupAvailable;
-    elements.saveButton.disabled = state.saving || errors.length > 0;
+    elements.saveButton.disabled = state.saving;
+    elements.saveButton.title = errors.length
+      ? `Fix before saving: ${errors[0]}`
+      : "";
     elements.closeButton.disabled = state.saving || errors.length > 0;
     elements.liveTestButton.disabled =
       state.saving || state.launchingLiveTest || errors.length > 0 || state.profile.bindings.length === 0;
