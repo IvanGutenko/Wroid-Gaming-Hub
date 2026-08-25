@@ -110,5 +110,10 @@ Contact ID чередуются пинг-понгом (`next_contact_id = old`),
   (move/relocate/recenter) в stderr.
 - Логи сессии: `~/.local/state/wroid/game-session.log`
   (`[stall]`-строки = задержки клавиатурного цикла).
-- После пересборки обязательно `pkill -f wroid` — демон живёт долго и держит
-  старый бинарник.
+- После пересборки обязательно `pkill -x wroid && pkill -x wroidd` — демон живёт
+  долго и держит старый бинарник.
+- Сборка только `-p wroid-cli` НЕ обновляет `target/release/wroidd` (демон живёт
+  в крейте wroid-daemon). Если менялась схема профиля (`wroid-core`) или демон —
+  собирайте весь workspace: `cargo build --release --workspace`, затем
+  `./target/release/wroid desktop install`. Иначе установленный старый демон
+  отвергнет новый профиль с «unknown variant» на новом действии.
