@@ -640,14 +640,18 @@ impl MouseAimController {
         let new_contact_id = self.next_contact_id;
 
         if self.settings.recenter_gap.is_zero() {
+            // Land the replacement contact directly at the residual offset
+            // inside the SAME frame as the swap. A separate follow-up move
+            // frame reads as a one-frame look pause in games that reset
+            // their gesture state on every new touch.
+            let landed = self.aim.region.clamp(offset_point(self.aim.origin, dx, dy));
             engine.submit(TouchFrame::new([
-                TouchEvent::new(new_contact_id, TouchPhase::Down, self.aim.origin),
+                TouchEvent::new(new_contact_id, TouchPhase::Down, landed),
                 TouchEvent::new(old_contact_id, TouchPhase::Up, old_position),
             ]))?;
             self.active_contact_id = Some(new_contact_id);
             self.next_contact_id = old_contact_id;
             self.last_reaffirm_at = Some(now);
-            self.apply_residual(engine, new_contact_id, dx, dy)?;
         } else {
             engine.end_contact(old_contact_id)?;
             self.active_contact_id = None;

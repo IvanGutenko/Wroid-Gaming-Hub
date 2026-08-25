@@ -33,16 +33,16 @@
       "action": {
         "kind": "mouse_aim",
         "region": {
-          "x": 0.55,
+          "x": 0.52,
           "y": 0.15,
           "w": 0.25,
           "h": 0.6
         },
         "sensitivity": 1.15,
-        "recenter_threshold": 0.5,
+        "recenter_threshold": 0.9,
         "recenter_gap_ms": 0,
         "ads_multiplier": 0.62,
-        "reaffirm_ms": 50
+        "reaffirm_ms": 250
       }
     },
     {
