@@ -1184,6 +1184,11 @@
   }
 
   function updateStatus() {
+    // A save request that never settles would leave every button disabled
+    // forever; recover after a generous timeout.
+    if (state.saving && Date.now() - (state.savingStartedAt || 0) > 15000) {
+      state.saving = false;
+    }
     const errors = state.profile ? validateProfile() : ["Profile is not loaded."];
     elements.validationState.innerHTML = errors.length
       ? `<span class="status-led error"></span> ${errors.length} validation issue${errors.length === 1 ? "" : "s"}`
@@ -1219,6 +1224,7 @@
       return false;
     }
     state.saving = true;
+    state.savingStartedAt = Date.now();
     updateStatus();
     try {
       const response = await fetch(api("/api/profile"), {
