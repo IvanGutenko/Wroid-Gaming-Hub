@@ -2528,15 +2528,41 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             {
                 continue;
             }
-            if let RuntimeControlAction::Tap { point } = &control.action {
-                tap_binding(
-                    &mut self.engine,
-                    point_contact(self.point_contacts[index])?,
-                    &control.name,
-                    *point,
-                    self.trace_input,
-                )?;
-                submitted = true;
+            match &control.action {
+                RuntimeControlAction::Tap { point } => {
+                    tap_binding(
+                        &mut self.engine,
+                        point_contact(self.point_contacts[index])?,
+                        &control.name,
+                        *point,
+                        self.trace_input,
+                    )?;
+                    submitted = true;
+                }
+                RuntimeControlAction::RadialSelect { center, target } => {
+                    let contact_id = point_contact(self.point_contacts[index])?;
+                    let binding_name = control.name.clone();
+                    let (center, target) = (*center, *target);
+                    // Same re-press safety as keyboard-triggered gestures.
+                    self.cancel_pending_radial(index)?;
+                    radial_down_phase(
+                        &mut self.engine,
+                        contact_id,
+                        &binding_name,
+                        center,
+                        self.trace_input,
+                    )?;
+                    self.pending_radials.push(PendingRadial {
+                        binding_index: index,
+                        contact_id,
+                        binding_name,
+                        target,
+                        phase: RadialPhase::Move,
+                        due_at: self.now().saturating_add(RADIAL_DOWN_DWELL),
+                    });
+                    submitted = true;
+                }
+                _ => {}
             }
         }
         Ok(submitted)
@@ -5311,6 +5337,69 @@ mod tests {
         runtime
             .advance_pending_radials(
                 2 * RADIAL_DOWN_DWELL + RADIAL_MOVE_DWELL + Duration::from_millis(2),
+            )
+            .unwrap();
+        assert!(runtime.pending_radials.is_empty());
+        assert_eq!(runtime.engine.state().active_contact_count(), 0);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn mouse_side_button_triggers_radial_and_middle_tap() {
+        let mut runtime = test_runtime(
+            vec![],
+            vec![
+                BindingV2 {
+                    name: "wheel_side".to_owned(),
+                    layer: None,
+                    modifier: None,
+                    input: InputV2::MouseButton {
+                        button: "side".to_owned(),
+                    },
+                    action: ActionV2::RadialSelect {
+                        center: NormalizedPoint { x: 0.5, y: 0.5 },
+                        distance: 0.07,
+                        direction: wroid_core::profile_v2::RadialDirection::Up,
+                    },
+                },
+                BindingV2 {
+                    name: "middle_tap".to_owned(),
+                    layer: None,
+                    modifier: None,
+                    input: InputV2::MouseButton {
+                        button: "middle".to_owned(),
+                    },
+                    action: ActionV2::Tap {
+                        point: NormalizedPoint { x: 0.9, y: 0.3 },
+                    },
+                },
+            ],
+        );
+
+        // Middle click taps immediately.
+        assert!(send_mouse_button(
+            &mut runtime,
+            wroid_input::mouse::MouseButton::Middle,
+            MouseButtonTransition::Pressed
+        ));
+        assert_eq!(
+            emitted_phases(&runtime),
+            vec![TouchPhase::Down, TouchPhase::Up]
+        );
+
+        // Side button opens the wheel and completes the timed gesture.
+        assert!(send_mouse_button(
+            &mut runtime,
+            wroid_input::mouse::MouseButton::Side,
+            MouseButtonTransition::Pressed
+        ));
+        assert_eq!(runtime.pending_radials.len(), 1);
+        runtime
+            .advance_pending_radials(RADIAL_DOWN_DWELL + Duration::from_millis(1))
+            .unwrap();
+        runtime
+            .advance_pending_radials(
+                RADIAL_DOWN_DWELL + RADIAL_MOVE_DWELL + Duration::from_millis(2),
             )
             .unwrap();
         assert!(runtime.pending_radials.is_empty());
