@@ -2401,17 +2401,24 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                     ) =>
                 {
                     let contact_id = point_contact(self.point_contacts[index])?;
+                    let binding_name = control.name.clone();
+                    let (center, target) = (*center, *target);
+                    // A re-press while the previous gesture is still in
+                    // flight would begin an already-active contact and kill
+                    // the session; finish the old gesture first.
+                    self.cancel_pending_radial(index)?;
                     radial_down_phase(
                         &mut self.engine,
                         contact_id,
-                        &control.name,
-                        *center,
+                        &binding_name,
+                        center,
                         self.trace_input,
                     )?;
                     self.pending_radials.push(PendingRadial {
+                        binding_index: index,
                         contact_id,
-                        binding_name: control.name.clone(),
-                        target: *target,
+                        binding_name,
+                        target,
                         phase: RadialPhase::Move,
                         due_at: now.saturating_add(RADIAL_DOWN_DWELL),
                     });
@@ -2566,8 +2573,31 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         Ok(())
     }
 
+    /// Finish an in-flight radial gesture for `binding_index` so a re-press
+    /// can safely reuse the binding's contact id.
+    fn cancel_pending_radial(&mut self, binding_index: usize) -> GameSessionResult<()> {
+        let Some(position) = self
+            .pending_radials
+            .iter()
+            .position(|pending| pending.binding_index == binding_index)
+        else {
+            return Ok(());
+        };
+        let pending = self.pending_radials.remove(position);
+        if self.engine.state().is_active(pending.contact_id) {
+            if let Err(error) = self.engine.end_contact(pending.contact_id) {
+                if self.trace_input {
+                    eprintln!(
+                        "[trace] runtime radial {} cancel failed: {error}",
+                        pending.binding_name
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn advance_pending_radials(&mut self, now: Duration) -> GameSessionResult<()> {
-        let mut error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
         let mut index = 0;
         while index < self.pending_radials.len() {
             let pending = &self.pending_radials[index];
@@ -2580,62 +2610,56 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                 self.pending_radials.remove(index);
                 continue;
             }
-            let PendingRadial {
-                contact_id,
-                binding_name,
-                target,
-                phase,
-                ..
-            } = pending;
-            let (contact_id, target, phase) = (*contact_id, *target, *phase);
-            let next_phase = match phase {
-                RadialPhase::Move => {
-                    if let Err(failure) = self.engine.move_contact(contact_id, target) {
-                        error = Some(failure.into());
-                        break;
-                    }
-                    if self.trace_input {
-                        println!(
-                            "[trace] runtime radial binding={binding_name} contact={} move=({},{})",
-                            contact_id.get(),
-                            target.x,
-                            target.y
-                        );
-                    }
-                    Some((RadialPhase::Release, now.saturating_add(RADIAL_MOVE_DWELL)))
-                }
-                RadialPhase::Release => {
-                    if let Err(failure) = self.engine.end_contact(contact_id) {
-                        error = Some(failure.into());
-                        break;
-                    }
-                    if self.trace_input {
-                        println!(
-                            "[trace] runtime radial binding={binding_name} contact={} up=({},{})",
-                            contact_id.get(),
-                            target.x,
-                            target.y
-                        );
-                    }
-                    None
-                }
+            let contact_id = pending.contact_id;
+            let target = pending.target;
+            let phase = pending.phase;
+            let binding_name = pending.binding_name.clone();
+            let failure = match phase {
+                RadialPhase::Move => self
+                    .engine
+                    .move_contact(contact_id, target)
+                    .map(|_| Some((RadialPhase::Release, now.saturating_add(RADIAL_MOVE_DWELL))))
+                    .err(),
+                RadialPhase::Release => self
+                    .engine
+                    .end_contact(contact_id)
+                    .map(|_| Option::<(RadialPhase, Duration)>::None)
+                    .err(),
             };
-            match next_phase {
-                Some((phase, due_at)) => {
+            if let Some(failure) = failure {
+                // One broken gesture must not kill the session; abandon it.
+                eprintln!(
+                    "[radial] {binding_name} {phase:?} phase failed: {failure}; gesture dropped"
+                );
+                self.pending_radials.remove(index);
+                continue;
+            }
+            if self.trace_input {
+                println!(
+                    "[trace] runtime radial binding={binding_name} contact={} {}=({},{})",
+                    contact_id.get(),
+                    if phase == RadialPhase::Move {
+                        "move"
+                    } else {
+                        "up"
+                    },
+                    target.x,
+                    target.y
+                );
+            }
+            match phase {
+                RadialPhase::Move => {
                     let pending = &mut self.pending_radials[index];
-                    pending.phase = phase;
-                    pending.due_at = due_at;
+                    pending.phase = RadialPhase::Release;
+                    pending.due_at = now.saturating_add(RADIAL_MOVE_DWELL);
                     index += 1;
                 }
-                None => {
+                RadialPhase::Release => {
                     self.pending_radials.remove(index);
                 }
             }
         }
-        match error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     fn suspend(&mut self) -> GameSessionResult<()> {
@@ -2751,6 +2775,7 @@ enum RadialPhase {
 
 #[derive(Debug)]
 struct PendingRadial {
+    binding_index: usize,
     contact_id: ContactId,
     binding_name: String,
     target: Point,
@@ -5234,6 +5259,62 @@ mod tests {
         // distance 0.07 * min(1000,1000) = 70px straight down.
         assert_eq!(frames[1].events()[0].position, Point { x: 500, y: 570 });
         assert_eq!(frames[2].events()[0].phase, TouchPhase::Up);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn radial_repress_while_in_flight_finishes_previous_gesture() {
+        let mut runtime = test_runtime(
+            vec![],
+            vec![BindingV2 {
+                name: "wheel".to_owned(),
+                layer: None,
+                modifier: None,
+                input: InputV2::Key {
+                    key: "1".to_owned(),
+                },
+                action: ActionV2::RadialSelect {
+                    center: NormalizedPoint { x: 0.5, y: 0.5 },
+                    distance: 0.07,
+                    direction: wroid_core::profile_v2::RadialDirection::Down,
+                },
+            }],
+        );
+
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::Num1,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        assert_eq!(runtime.engine.injector().frames.len(), 1);
+
+        // Re-press during the down dwell must not begin the contact twice.
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::Num1,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        // The old gesture released its contact; the new one is down again.
+        let frames = &runtime.engine.injector().frames;
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[1].events()[0].phase, TouchPhase::Up);
+        assert_eq!(frames[2].events()[0].phase, TouchPhase::Down);
+        assert_eq!(runtime.pending_radials.len(), 1);
+        assert_eq!(runtime.engine.state().active_contact_count(), 1);
+
+        // The replacement gesture completes normally.
+        runtime
+            .advance_pending_radials(RADIAL_DOWN_DWELL + Duration::from_millis(1))
+            .unwrap();
+        runtime
+            .advance_pending_radials(
+                2 * RADIAL_DOWN_DWELL + RADIAL_MOVE_DWELL + Duration::from_millis(2),
+            )
+            .unwrap();
+        assert!(runtime.pending_radials.is_empty());
+        assert_eq!(runtime.engine.state().active_contact_count(), 0);
         runtime.stop().unwrap();
     }
 }
