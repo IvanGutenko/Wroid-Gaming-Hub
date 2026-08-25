@@ -1764,7 +1764,9 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                         .get()
                         .max(settings.alternate_contact_id.get()),
                 ),
-                RuntimeControlAction::Tap { .. } | RuntimeControlAction::Hold { .. } => None,
+                RuntimeControlAction::Tap { .. }
+                | RuntimeControlAction::Hold { .. }
+                | RuntimeControlAction::RadialSelect { .. } => None,
             })
             .max()
             .unwrap_or(0)
@@ -2383,6 +2385,28 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                     submitted = true;
                 }
                 (
+                    ResolvedControlInput::Key(binding_key),
+                    RuntimeControlAction::RadialSelect { center, target },
+                ) if binding_key == key
+                    && binding_available(
+                        control,
+                        physical,
+                        self.active_layers,
+                        self.held_modifiers,
+                        &self.selected_input_layers,
+                    ) =>
+                {
+                    radial_select_binding(
+                        &mut self.engine,
+                        point_contact(self.point_contacts[index])?,
+                        &control.name,
+                        *center,
+                        *target,
+                        self.trace_input,
+                    )?;
+                    submitted = true;
+                }
+                (
                     ResolvedControlInput::KeyCluster {
                         up,
                         left,
@@ -2620,6 +2644,42 @@ fn tap_binding<I: TouchInjector>(
             contact_id.get(),
             point.x,
             point.y
+        );
+    }
+    Ok(())
+}
+
+fn radial_select_binding<I: TouchInjector>(
+    engine: &mut TouchEngine<I>,
+    contact_id: ContactId,
+    binding: &str,
+    center: Point,
+    target: Point,
+    trace_input: bool,
+) -> GameSessionResult<()> {
+    engine.submit(TouchFrame::single(TouchEvent::new(
+        contact_id,
+        TouchPhase::Down,
+        center,
+    )))?;
+    engine.submit(TouchFrame::single(TouchEvent::new(
+        contact_id,
+        TouchPhase::Move,
+        target,
+    )))?;
+    engine.submit(TouchFrame::single(TouchEvent::new(
+        contact_id,
+        TouchPhase::Up,
+        target,
+    )))?;
+    if trace_input {
+        println!(
+            "[trace] runtime radial binding={binding} contact={} center=({},{}) target=({},{})",
+            contact_id.get(),
+            center.x,
+            center.y,
+            target.x,
+            target.y
         );
     }
     Ok(())

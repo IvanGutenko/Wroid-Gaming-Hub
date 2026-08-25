@@ -164,6 +164,16 @@ fn print_materialized_action(label: &str, action: &ActionV2, resolution: Resolut
                 size.x, size.y
             );
         }
+        ActionV2::RadialSelect {
+            center,
+            distance,
+            direction,
+        } => {
+            println!(
+                "{indent}{label}: radial_select center={} distance={distance} direction={direction:?}",
+                center.materialize(resolution)
+            );
+        }
         ActionV2::Macro { steps } => {
             println!("{indent}{label}: macro with {} step(s)", steps.len());
             for (index, step) in steps.iter().enumerate() {

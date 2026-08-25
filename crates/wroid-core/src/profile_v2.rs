@@ -297,6 +297,29 @@ pub enum ActionV2 {
     Macro {
         steps: Vec<ActionV2>,
     },
+    /// Emulates a radial weapon wheel: touch down on `center`, swipe toward
+    /// `direction`, release. One binding per weapon sector.
+    RadialSelect {
+        center: NormalizedPoint,
+        #[serde(default = "default_radial_distance")]
+        distance: f64,
+        #[serde(default)]
+        direction: RadialDirection,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RadialDirection {
+    #[default]
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+fn default_radial_distance() -> f64 {
+    0.07
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -588,6 +611,20 @@ fn validate_action(action: &ActionV2, binding: &str, errors: &mut Vec<String>) {
                 ));
             }
         }
+        ActionV2::RadialSelect {
+            center, distance, ..
+        } => {
+            validate_point(
+                *center,
+                &format!("binding {binding} radial_select center"),
+                errors,
+            );
+            if !distance.is_finite() || *distance <= 0.0 || *distance > 1.0 {
+                errors.push(format!(
+                    "binding {binding} radial_select distance must be finite and within 0.0..=1.0"
+                ));
+            }
+        }
         ActionV2::Macro { steps } => {
             if steps.is_empty() {
                 errors.push(format!(
@@ -621,6 +658,7 @@ fn validate_binding_compatibility(
         | ActionV2::Hold { .. }
         | ActionV2::VirtualJoystick { .. }
         | ActionV2::MouseAim { .. }
+        | ActionV2::RadialSelect { .. }
         | ActionV2::Macro { .. } => None,
     };
     if let Some(required) = required {
@@ -648,6 +686,7 @@ fn action_kind(action: &ActionV2) -> &'static str {
         ActionV2::Hold { .. } => "hold",
         ActionV2::VirtualJoystick { .. } => "virtual_joystick",
         ActionV2::MouseAim { .. } => "mouse_aim",
+        ActionV2::RadialSelect { .. } => "radial_select",
         ActionV2::Macro { .. } => "macro",
     }
 }
@@ -1285,7 +1324,7 @@ mod tests {
 
         assert!(matches!(
             action,
-            ActionV2::MouseAim {
+        ActionV2::MouseAim {
                 toggle_key: None,
                 recenter_threshold,
                 recenter_gap_ms: 0,

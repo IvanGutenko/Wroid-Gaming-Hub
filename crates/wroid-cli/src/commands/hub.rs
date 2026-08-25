@@ -639,7 +639,8 @@ fn input_devices_json(result: std::result::Result<Vec<InputDeviceInfo>, String>)
 }
 
 fn library_game_json(entry: &LibraryProfile, installed_packages: Option<&[String]>) -> Value {
-    let (taps, holds, joysticks, mouse_aim, layers) = control_counts(&entry.profile);
+    let (taps, holds, joysticks, mouse_aim, layers, radial_selects) =
+        control_counts(&entry.profile);
     let layer_metadata = entry
         .profile
         .layers
@@ -671,6 +672,7 @@ fn library_game_json(entry: &LibraryProfile, installed_packages: Option<&[String
             "holds": holds,
             "joysticks": joysticks,
             "mouseAim": mouse_aim,
+            "radialSelects": radial_selects,
         },
         "calibration": calibration_json(&entry.path),
         "installed": installed_packages.map(|packages| {
@@ -679,16 +681,17 @@ fn library_game_json(entry: &LibraryProfile, installed_packages: Option<&[String
     })
 }
 
-fn control_counts(profile: &ProfileV2) -> (usize, usize, usize, usize, usize) {
+fn control_counts(profile: &ProfileV2) -> (usize, usize, usize, usize, usize, usize) {
     let action_counts = profile
         .bindings
         .iter()
-        .fold((0, 0, 0, 0), |mut counts, binding| {
+        .fold((0, 0, 0, 0, 0), |mut counts, binding| {
             match binding.action {
                 ActionV2::Tap { .. } => counts.0 += 1,
                 ActionV2::Hold { .. } => counts.1 += 1,
                 ActionV2::VirtualJoystick { .. } => counts.2 += 1,
                 ActionV2::MouseAim { .. } => counts.3 += 1,
+                ActionV2::RadialSelect { .. } => counts.4 += 1,
                 ActionV2::Macro { .. } => {}
             }
             counts
@@ -699,6 +702,7 @@ fn control_counts(profile: &ProfileV2) -> (usize, usize, usize, usize, usize) {
         action_counts.2,
         action_counts.3,
         profile.layers.len(),
+        action_counts.4,
     )
 }
 

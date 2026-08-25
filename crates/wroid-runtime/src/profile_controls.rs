@@ -409,6 +409,10 @@ pub enum RuntimeControlAction {
         aim: MouseAim,
         settings: MouseAimSettings,
     },
+    RadialSelect {
+        center: Point,
+        target: Point,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -598,6 +602,31 @@ fn materialize_action(
                 reaffirm_interval: reaffirm_ms.map(Duration::from_millis),
             };
             Ok(RuntimeControlAction::MouseAim { aim, settings })
+        }
+        ActionV2::RadialSelect {
+            center,
+            distance,
+            direction,
+        } => {
+            use wroid_core::profile_v2::{materialize_radius, RadialDirection};
+            let center = center.materialize(resolution);
+            let reach = i64::from(materialize_radius(*distance, resolution));
+            let (dx, dy) = match direction {
+                RadialDirection::Up => (0, -reach),
+                RadialDirection::Down => (0, reach),
+                RadialDirection::Left => (-reach, 0),
+                RadialDirection::Right => (reach, 0),
+            };
+            let clamp_axis = |value: i64, limit: u32| -> u32 {
+                value.clamp(0, i64::from(limit.saturating_sub(1))) as u32
+            };
+            Ok(RuntimeControlAction::RadialSelect {
+                center,
+                target: Point {
+                    x: clamp_axis(i64::from(center.x) + dx, resolution.width),
+                    y: clamp_axis(i64::from(center.y) + dy, resolution.height),
+                },
+            })
         }
         ActionV2::Macro { .. } => Err(RuntimeControlPlanError::UnsupportedAction {
             binding: binding.name.clone(),

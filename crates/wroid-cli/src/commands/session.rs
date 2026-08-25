@@ -184,6 +184,12 @@ fn describe_action(action: &RuntimeControlAction) -> String {
             settings.alternate_contact_id.get(),
             settings.toggle_key.as_deref().unwrap_or("always"),
         ),
+        RuntimeControlAction::RadialSelect { center, target } => {
+            format!(
+                "radial_select center=({},{}) target=({},{})",
+                center.x, center.y, target.x, target.y
+            )
+        }
     }
 }
 

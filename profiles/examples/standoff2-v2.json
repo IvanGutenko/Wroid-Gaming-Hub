@@ -116,31 +116,35 @@
       }
     },
     {
-      "name": "primary_weapon",
+      "name": "weapon-1-wheel",
       "input": {
         "kind": "key",
         "key": "1"
       },
       "action": {
-        "kind": "tap",
-        "point": {
-          "x": 0.89,
-          "y": 0.18
-        }
+        "kind": "radial_select",
+        "center": {
+          "x": 0.91,
+          "y": 0.14
+        },
+        "distance": 0.07,
+        "direction": "left"
       }
     },
     {
-      "name": "secondary_weapon",
+      "name": "weapon-2-wheel",
       "input": {
         "kind": "key",
         "key": "2"
       },
       "action": {
-        "kind": "tap",
-        "point": {
-          "x": 0.79,
-          "y": 0.18
-        }
+        "kind": "radial_select",
+        "center": {
+          "x": 0.91,
+          "y": 0.14
+        },
+        "distance": 0.07,
+        "direction": "down"
       }
     },
     {
@@ -155,6 +159,38 @@
           "x": 0.6,
           "y": 0.57
         }
+      }
+    },
+    {
+      "name": "weapon-3-wheel",
+      "input": {
+        "kind": "key",
+        "key": "3"
+      },
+      "action": {
+        "kind": "radial_select",
+        "center": {
+          "x": 0.85,
+          "y": 0.15
+        },
+        "distance": 0.07,
+        "direction": "left"
+      }
+    },
+    {
+      "name": "weapon-4-wheel",
+      "input": {
+        "kind": "key",
+        "key": "4"
+      },
+      "action": {
+        "kind": "radial_select",
+        "center": {
+          "x": 0.85,
+          "y": 0.15
+        },
+        "distance": 0.07,
+        "direction": "down"
       }
     }
   ]
