@@ -1656,6 +1656,12 @@ kbd {
   box-shadow: 0 0 0 4px var(--orange-soft), 0 0 22px rgba(255, 120, 71, 0.48);
 }
 
+.wheel-node {
+  border-color: #7ec8ff;
+  color: #7ec8ff;
+  background: rgba(126, 200, 255, 0.16);
+}
+
 .hold-node {
   width: 38px;
   height: 38px;

@@ -1784,7 +1784,9 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             );
             if matches!(
                 control.action,
-                RuntimeControlAction::Tap { .. } | RuntimeControlAction::Hold { .. }
+                RuntimeControlAction::Tap { .. }
+                    | RuntimeControlAction::Hold { .. }
+                    | RuntimeControlAction::RadialSelect { .. }
             ) {
                 point_contacts.push(Some(ContactId::new(next_contact)));
                 next_contact = next_contact.saturating_add(1);

@@ -130,6 +130,7 @@
       hold: "Hold",
       virtual_joystick: "Virtual joystick",
       mouse_aim: "Mouse aim",
+      radial_select: "Weapon wheel",
     }[kind] || kind;
   }
 
@@ -552,15 +553,16 @@
 
   function createControlNode(binding, index) {
     const action = binding.action;
-    if (!["tap", "hold", "virtual_joystick", "mouse_aim"].includes(action.kind)) return null;
+    if (!["tap", "hold", "virtual_joystick", "mouse_aim", "radial_select"].includes(action.kind)) return null;
     const node = document.createElement("div");
     node.dataset.index = String(index);
     node.dataset.bindingIndex = String(index);
     node.dataset.kind = action.kind;
-    const pointAction = action.kind === "tap" || action.kind === "hold";
-    node.className = `control-node ${action.kind === "tap" ? "tap-node" : action.kind === "hold" ? "hold-node" : action.kind === "virtual_joystick" ? "joystick-node" : "aim-node"}${index === state.selected ? " is-selected" : ""}`;
+    const pointAction = action.kind === "tap" || action.kind === "hold" || action.kind === "radial_select";
+    const directionGlyph = { up: "↑", down: "↓", left: "←", right: "→" }[action.direction] || "◎";
+    node.className = `control-node ${action.kind === "tap" ? "tap-node" : action.kind === "hold" ? "hold-node" : action.kind === "radial_select" ? "tap-node wheel-node" : action.kind === "virtual_joystick" ? "joystick-node" : "aim-node"}${index === state.selected ? " is-selected" : ""}`;
     node.innerHTML = `
-      ${pointAction ? `<span class="node-key">${escapeHtml(controlKey(binding))}</span>` : ""}
+      ${pointAction ? `<span class="node-key">${escapeHtml(action.kind === "radial_select" ? `${controlKey(binding)} ${directionGlyph}` : controlKey(binding))}</span>` : ""}
       <span class="control-label">${escapeHtml(binding.name)} / ${escapeHtml(controlKey(binding))} / ${escapeHtml(Model.layerDisplayName(binding))}</span>
       ${!pointAction && index === state.selected ? '<span class="resize-handle" data-resize="true"></span>' : ""}
     `;
@@ -573,6 +575,11 @@
     if (action.kind === "tap" || action.kind === "hold") {
       node.style.left = `${action.point.x * 100}%`;
       node.style.top = `${action.point.y * 100}%`;
+      return;
+    }
+    if (action.kind === "radial_select") {
+      node.style.left = `${action.center.x * 100}%`;
+      node.style.top = `${action.center.y * 100}%`;
       return;
     }
     if (action.kind === "virtual_joystick") {
@@ -642,6 +649,9 @@
       if (action.kind === "tap" || action.kind === "hold") {
         action.point.x = snapped(original.point.x + dx);
         action.point.y = snapped(original.point.y + dy);
+      } else if (action.kind === "radial_select") {
+        action.center.x = snapped(original.center.x + dx);
+        action.center.y = snapped(original.center.y + dy);
       } else if (action.kind === "virtual_joystick") {
         action.center.x = snapped(original.center.x + dx);
         action.center.y = snapped(original.center.y + dy);
@@ -757,7 +767,7 @@
   }
 
   function inputOptionsForAction(kind) {
-    if (kind === "tap" || kind === "hold") {
+    if (kind === "tap" || kind === "hold" || kind === "radial_select") {
       return [
         ["key", "Keyboard key"],
         ["mouse_button", "Mouse button"],
@@ -823,6 +833,18 @@
         <div>${numberField("tapX", "X position", action.point.x)}</div>
         <div>${numberField("tapY", "Y position", action.point.y)}</div>
       </div><p class="hint">${verb} Drag the marker to the matching button in the game HUD.</p>`;
+    }
+    if (action.kind === "radial_select") {
+      const directions = [["up", "Up ↑"], ["down", "Down ↓"], ["left", "Left ←"], ["right", "Right →"]];
+      return `<div class="inspector-row">
+          <div>${numberField("radialCenterX", "Wheel center X", action.center.x)}</div>
+          <div>${numberField("radialCenterY", "Wheel center Y", action.center.y)}</div>
+        </div>
+        <div class="inspector-row">
+          <div>${numberField("radialDistance", "Swipe distance", action.distance ?? 0.07, 0.001, 1, 0.005)}</div>
+          <div>${selectField("radialDirection", "Sector direction", action.direction || "up", directions)}</div>
+        </div>
+        <p class="hint">Key press = touch the wheel button, swipe one sector ${escapeHtml((action.direction || "up").toUpperCase())}, release. Distance is relative to the shorter screen edge.</p>`;
     }
     if (action.kind === "virtual_joystick") {
       return `<div class="inspector-row">
@@ -957,6 +979,11 @@
     if (action.kind === "tap" || action.kind === "hold") {
       wireChange("tapX", (value) => { action.point.x = normalized(value); }, number);
       wireChange("tapY", (value) => { action.point.y = normalized(value); }, number);
+    } else if (action.kind === "radial_select") {
+      wireChange("radialCenterX", (value) => { action.center.x = normalized(value); }, number);
+      wireChange("radialCenterY", (value) => { action.center.y = normalized(value); }, number);
+      wireChange("radialDistance", (value) => { action.distance = rounded(clamp(value, 0.001, 1), 4); }, number);
+      wireChange("radialDirection", (value) => { action.direction = value; });
     } else if (action.kind === "virtual_joystick") {
       wireChange("stickX", (value) => { action.center.x = normalized(value); }, number);
       wireChange("stickY", (value) => { action.center.y = normalized(value); }, number);
@@ -1030,6 +1057,17 @@
           name: uniqueName("new_hold"),
           input: defaultInput("mouse_button"),
           action: { kind: "hold", point: { x: 0.5, y: 0.5 } },
+        };
+      } else if (kind === "radial_select") {
+        binding = {
+          name: uniqueName("weapon_wheel"),
+          input: defaultInput("key"),
+          action: {
+            kind: "radial_select",
+            center: { x: 0.88, y: 0.14 },
+            distance: 0.07,
+            direction: "up",
+          },
         };
       } else if (kind === "virtual_joystick") {
         binding = {

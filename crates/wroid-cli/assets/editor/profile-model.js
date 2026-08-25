@@ -204,6 +204,17 @@
       }
       return;
     }
+    if (action.kind === "radial_select") {
+      validatePoint(action.center, `binding ${bindingName} radial_select center`, errors);
+      const distance = action.distance ?? 0.07;
+      if (!Number.isFinite(distance) || distance <= 0 || distance > 1) {
+        errors.push(`binding ${bindingName} radial_select distance must be finite and within 0.0..=1.0`);
+      }
+      if (action.direction && !["up", "down", "left", "right"].includes(action.direction)) {
+        errors.push(`binding ${bindingName} radial_select direction must be one of up/down/left/right`);
+      }
+      return;
+    }
     if (action.kind === "macro") {
       if (!action.steps?.length) errors.push(`binding ${bindingName} macro must contain at least one step`);
       (action.steps || []).forEach((step, index) => validateAction(step, `${bindingName}.step[${index}]`, errors));
@@ -230,7 +241,7 @@
   function validateCompatibility(input, action, bindingName, errors) {
     if (!input || !action) return;
     let required = null;
-    if (["tap", "hold"].includes(action.kind) && !["key", "mouse_button"].includes(input.kind)) required = "key or mouse_button";
+    if (["tap", "hold", "radial_select"].includes(action.kind) && !["key", "mouse_button"].includes(input.kind)) required = "key or mouse_button";
     if (action.kind === "virtual_joystick" && input.kind !== "key_cluster") required = "key_cluster";
     if (action.kind === "mouse_aim" && input.kind !== "mouse_move") required = "mouse_move";
     if (required) {
