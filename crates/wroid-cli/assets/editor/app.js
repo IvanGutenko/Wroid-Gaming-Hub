@@ -47,6 +47,7 @@
     screenshot: document.querySelector("#screenshot"),
     screenshotInput: document.querySelector("#screenshotInput"),
     screenshotButton: document.querySelector("#screenshotButton"),
+    snapshotButton: document.querySelector("#snapshotButton"),
     captureButton: document.querySelector("#captureButton"),
     clearBackgroundButton: document.querySelector("#clearBackgroundButton"),
     backgroundState: document.querySelector("#backgroundState"),
@@ -856,7 +857,7 @@
         <div>${numberField("aimAds", "ADS multiplier", action.ads_multiplier ?? 0.6, 0.1, 1, 0.01)}</div>
         <div>${numberField("aimReaffirm", "Reaffirm (ms)", action.reaffirm_ms ?? 50, 1, 5000, 1)}</div>
       </div>
-      <p class="hint">Tab is recommended for capture toggle. Leave the toggle key empty for always-on aim.</p>`;
+      <p class="hint">F10 is recommended for the capture toggle (F12 is reserved for input capture). Leave the toggle key empty for always-on aim.</p>`;
   }
 
   function wireChange(id, setter, parser = (value) => value) {
@@ -1051,7 +1052,7 @@
             kind: "mouse_aim",
             region: { x: 0.35, y: 0.08, w: 0.58, h: 0.7 },
             sensitivity: 1,
-            toggle_key: "tab",
+            toggle_key: "f10",
             recenter_threshold: 0.7,
             recenter_gap_ms: 0,
             ads_multiplier: 0.6,
@@ -1287,9 +1288,26 @@
     };
   }
 
-  function calibrationSourceRect(video, targetWidth, targetHeight) {
-    const sourceWidth = video.videoWidth;
-    const sourceHeight = video.videoHeight;
+  function calibrationMedia(calibration) {
+    if (calibration.kind === "native") {
+      return {
+        element: calibration.image,
+        width: calibration.image.naturalWidth,
+        height: calibration.image.naturalHeight,
+        ready: calibration.image.complete && calibration.image.naturalWidth > 0,
+      };
+    }
+    return {
+      element: calibration.video,
+      width: calibration.video.videoWidth,
+      height: calibration.video.videoHeight,
+      ready: calibration.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA,
+    };
+  }
+
+  function calibrationSourceRect(media, targetWidth, targetHeight) {
+    const sourceWidth = media.width;
+    const sourceHeight = media.height;
     const targetAspect = targetWidth / targetHeight;
     const sourceAspect = sourceWidth / sourceHeight;
     let baseWidth;
@@ -1319,13 +1337,15 @@
 
   function drawCalibrationFrame(canvas, width, height) {
     const calibration = state.calibration;
-    if (!calibration || calibration.video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return false;
+    if (!calibration) return false;
+    const media = calibrationMedia(calibration);
+    if (!media.ready) return false;
     if (canvas.width !== width) canvas.width = width;
     if (canvas.height !== height) canvas.height = height;
-    const source = calibrationSourceRect(calibration.video, width, height);
+    const source = calibrationSourceRect(media, width, height);
     const context = canvas.getContext("2d", { alpha: false });
     context.drawImage(
-      calibration.video,
+      media.element,
       source.x,
       source.y,
       source.width,
@@ -1386,12 +1406,19 @@
     if (!calibration) return;
     state.calibration = null;
     cancelAnimationFrame(calibration.animationFrame);
-    calibration.stream.getTracks().forEach((track) => {
-      track.onended = null;
-      track.stop();
-    });
-    calibration.video.pause();
-    calibration.video.srcObject = null;
+    if (calibration.kind === "native") {
+      calibration.image.src = "";
+      // Fire-and-forget: the server also ends the stream when the
+      // connection drops; this just releases the single-stream slot sooner.
+      fetch(api("/api/live.mjpg"), { method: "DELETE" }).catch(() => {});
+    } else {
+      calibration.stream.getTracks().forEach((track) => {
+        track.onended = null;
+        track.stop();
+      });
+      calibration.video.pause();
+      calibration.video.srcObject = null;
+    }
     liveCalibrationUi(false);
     if (notify) toast("Live window calibration ended.");
   }
@@ -1438,13 +1465,105 @@
     await persistBackground(file);
   }
 
+  function captureSnapshot() {
+    elements.snapshotButton.disabled = true;
+    toast("Capturing a desktop snapshot…");
+    fetch(api("/api/snapshot"), { method: "POST" })
+      .then((response) => {
+        if (!response.ok) {
+          return response
+            .json()
+            .then((body) => Promise.reject(new Error(body.error || "Snapshot failed")))
+            .catch(() => Promise.reject(new Error("Snapshot failed")));
+        }
+        return response.blob();
+      })
+      .then((blob) => {
+        showBackground(blob, false);
+        stopLiveCalibration();
+        toast("Snapshot captured. Align controls over the frame, then save it with this profile.");
+      })
+      .catch((error) => {
+        console.error("[snapshot]", error);
+        toast(`Snapshot failed: ${error.message}`, true);
+      })
+      .finally(() => {
+        elements.snapshotButton.disabled = false;
+      });
+  }
+
+  function nativeLiveFrame(image, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        image.onload = null;
+        image.onerror = null;
+        image.src = "";
+        reject(new Error("The native capture stream did not deliver a frame in time."));
+      }, timeoutMs);
+      image.onload = () => {
+        if (image.naturalWidth > 0) {
+          clearTimeout(timeout);
+          image.onload = null;
+          image.onerror = null;
+          resolve();
+        }
+      };
+      image.onerror = () => {
+        clearTimeout(timeout);
+        image.onload = null;
+        image.onerror = null;
+        image.src = "";
+        reject(new Error("The native capture stream could not be opened."));
+      };
+    });
+  }
+
+  // Portal-free live alignment: the editor server captures desktop frames
+  // through the KWin ScreenShot2 D-Bus API and streams them as multipart
+  // BMP parts. Works even when xdg-desktop-portal ScreenCast is broken.
+  async function startNativeLiveCapture(contextMessage) {
+    const image = new Image();
+    image.decoding = "sync";
+    image.src = api("/api/live.mjpg");
+    try {
+      await nativeLiveFrame(image, 10_000);
+    } catch (error) {
+      toast(
+        contextMessage
+          ? `${contextMessage} Native capture also failed: ${error.message}`
+          : `Native capture failed: ${error.message}`,
+        true,
+      );
+      return false;
+    }
+    state.calibration = {
+      kind: "native",
+      image,
+      animationFrame: 0,
+      zoom: 1,
+      offsetX: 0,
+      offsetY: 0,
+    };
+    elements.calibrationSource.textContent =
+      `Wroid native capture · KWin ScreenShot2 · ${image.naturalWidth}×${image.naturalHeight}`;
+    renderCalibrationControls();
+    liveCalibrationUi(true);
+    renderLiveCalibration();
+    toast(
+      contextMessage
+        ? `${contextMessage} Using Wroid native capture instead. Align the controls over the HUD, then save an aligned frame.`
+        : "Live alignment active. Move controls over the HUD, then save an aligned frame.",
+    );
+    return true;
+  }
+
   async function captureWindow() {
     if (state.calibration) {
       stopLiveCalibration({ notify: true });
       return;
     }
     if (!navigator.mediaDevices?.getDisplayMedia) {
-      toast("Window capture is not supported by this browser.", true);
+      await startNativeLiveCapture("This browser cannot share windows itself.");
       return;
     }
     let stream;
@@ -1465,6 +1584,7 @@
       const track = stream.getVideoTracks()[0];
       const settings = track.getSettings();
       state.calibration = {
+        kind: "portal",
         stream,
         video,
         animationFrame: 0,
@@ -1492,7 +1612,10 @@
     } catch (error) {
       if (state.calibration) stopLiveCalibration();
       else stream?.getTracks().forEach((track) => track.stop());
-      toast(Guide.captureErrorMessage(error), true);
+      const message = Guide.captureErrorMessage(error);
+      // The portal ScreenCast backend is unreliable on some Plasma setups
+      // (PipeWire "target not found"): fall back to Wroid native capture.
+      await startNativeLiveCapture(message);
     }
   }
 
@@ -1621,6 +1744,7 @@
     elements.screenshotButton.addEventListener("click", () => elements.screenshotInput.click());
     elements.screenshotInput.addEventListener("change", () => loadScreenshot(elements.screenshotInput.files[0]));
     elements.captureButton.addEventListener("click", captureWindow);
+    elements.snapshotButton.addEventListener("click", captureSnapshot);
     elements.calibrationStopButton.addEventListener("click", () => stopLiveCalibration({ notify: true }));
     elements.calibrationSaveButton.addEventListener("click", saveCalibrationFrame);
     elements.calibrationResetButton.addEventListener("click", resetCalibration);

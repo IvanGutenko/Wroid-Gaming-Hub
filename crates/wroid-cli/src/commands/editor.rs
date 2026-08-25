@@ -5,15 +5,16 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use wroid_core::profile_v2::ProfileV2;
 
 use super::desktop_webview::{self, CONTROLS_WINDOW};
+use super::kwin_screenshot;
 use super::local_web_app::{LocalWebApp, WebUiMode};
 use super::preferences;
 use super::terminal::spawn_terminal;
@@ -27,6 +28,9 @@ const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_PROFILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Native live-stream state: 0 idle, 1 streaming, 2 stop requested.
+static LIVE_STREAM_STATE: AtomicU8 = AtomicU8::new(0);
+const LIVE_STREAM_INTERVAL: Duration = Duration::from_millis(80);
 
 pub(crate) fn edit_v2(path: PathBuf, port: u16, mode: WebUiMode) -> Result<()> {
     if mode == WebUiMode::Native {
@@ -97,21 +101,113 @@ fn serve_connection(mut stream: TcpStream, path: &Path, token: &str, shutdown: &
         eprintln!("Warning: could not configure editor client: {error}");
         return;
     }
-    match read_request(&mut stream) {
-        Ok(request) => {
-            let (response, close) = handle_request(&request, path, token);
-            if let Err(error) = write_response(&mut stream, response) {
-                eprintln!("Warning: editor client disconnected: {error}");
-            }
-            if close {
-                shutdown.store(true, Ordering::Release);
-            }
-        }
+    let request = match read_request(&mut stream) {
+        Ok(request) => request,
         Err(error) => {
             let _ = write_response(
                 &mut stream,
                 Response::json(400, &json_error(&error.to_string())),
             );
+            return;
+        }
+    };
+    // The live stream outlives a single buffered response; serve it inline
+    // until the browser disconnects or requests a stop.
+    if request.method == "GET" && request.target.starts_with("/api/live.mjpg") {
+        serve_live_stream(&mut stream, &request, token);
+        return;
+    }
+    let (response, close) = handle_request(&request, path, token);
+    if let Err(error) = write_response(&mut stream, response) {
+        eprintln!("Warning: editor client disconnected: {error}");
+    }
+    if close {
+        shutdown.store(true, Ordering::Release);
+    }
+}
+
+/// Stream desktop frames as multipart/x-mixed-replace BMP parts.
+///
+/// This bypasses xdg-desktop-portal entirely (its ScreenCast backend can die
+/// with PipeWire "target not found" on Plasma): each part is one KWin
+/// ScreenShot2 capture. One stream at a time keeps CPU bounded.
+fn serve_live_stream(stream: &mut TcpStream, request: &Request, token: &str) {
+    let authorized = request
+        .target
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .any(|(name, value)| name == "token" && value == token);
+    if !authorized {
+        let _ = write_response(
+            stream,
+            Response::json(403, r#"{"ok":false,"error":"Invalid editor token"}"#),
+        );
+        return;
+    }
+    if LIVE_STREAM_STATE
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        let _ = write_response(
+            stream,
+            Response::json(
+                409,
+                &json_error("a live window stream is already active in another tab"),
+            ),
+        );
+        return;
+    }
+
+    let header = "HTTP/1.1 200 OK\r\n\
+         Content-Type: multipart/x-mixed-replace; boundary=wroidframe\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\
+         X-Content-Type-Options: nosniff\r\n\r\n";
+    let result = (|| -> io::Result<()> {
+        stream.write_all(header.as_bytes())?;
+        loop {
+            if LIVE_STREAM_STATE.load(Ordering::Acquire) == 2 {
+                break;
+            }
+            let started = Instant::now();
+            match kwin_screenshot::capture_active_screen() {
+                Ok(frame) => {
+                    let bmp = kwin_screenshot::frame_to_bmp(&frame);
+                    write!(
+                        stream,
+                        "--wroidframe\r\nContent-Type: image/bmp\r\nContent-Length: {}\r\n\r\n",
+                        bmp.len()
+                    )?;
+                    stream.write_all(&bmp)?;
+                    stream.flush()?;
+                }
+                Err(error) => {
+                    eprintln!("[live-stream] capture failed: {error:#}");
+                    let message =
+                        format!("--wroidframe\r\nContent-Type: text/plain\r\n\r\n{error}\n");
+                    stream.write_all(message.as_bytes())?;
+                    stream.flush()?;
+                    break;
+                }
+            }
+            let spent = started.elapsed();
+            if spent < LIVE_STREAM_INTERVAL {
+                thread::sleep(LIVE_STREAM_INTERVAL - spent);
+            }
+        }
+        Ok(())
+    })();
+    LIVE_STREAM_STATE.store(0, Ordering::Release);
+    if let Err(error) = result {
+        // Browser disconnects are the normal way a stream ends.
+        if error.kind() != io::ErrorKind::UnexpectedEof
+            && error.kind() != io::ErrorKind::BrokenPipe
+            && error.kind() != io::ErrorKind::ConnectionReset
+        {
+            eprintln!("[live-stream] ended with {error}");
         }
     }
 }
@@ -204,6 +300,12 @@ fn handle_request(request: &Request, profile_path: &Path, token: &str) -> (Respo
         .target
         .split_once('?')
         .unwrap_or((&request.target, ""));
+    eprintln!(
+        "[editor-http] {} {} (body={} bytes)",
+        request.method,
+        request.target,
+        request.body.len()
+    );
     let authorized = query
         .split('&')
         .filter_map(|part| part.split_once('='))
@@ -350,7 +452,7 @@ fn handle_request(request: &Request, profile_path: &Path, token: &str) -> (Respo
                 return (
                     Response::json(
                         422,
-                        &json_error("background must be a PNG, JPEG, WebP, or GIF image"),
+                        &json_error("background must be a PNG, JPEG, WebP, GIF, or BMP image"),
                     ),
                     false,
                 );
@@ -384,6 +486,53 @@ fn handle_request(request: &Request, profile_path: &Path, token: &str) -> (Respo
                 ),
                 Err(error) => (Response::json(500, &json_error(&error.to_string())), false),
             }
+        }
+        ("POST", "/api/snapshot") if authorized => {
+            // Primary: KWin ScreenShot2 of the gaming monitor only (highest
+            // refresh output, or WROID_SNAPSHOT_OUTPUT). Spectacle `-f` grabs
+            // the whole desktop across every monitor, so it is only a
+            // fallback when the KWin path is unavailable.
+            match kwin_screenshot::capture_primary_screen() {
+                Ok(frame) => (
+                    Response::bytes(200, "image/bmp", kwin_screenshot::frame_to_bmp(&frame)),
+                    false,
+                ),
+                Err(kwin_error) => {
+                    eprintln!(
+                        "[snapshot] KWin ScreenShot2 failed, trying spectacle: {kwin_error:#}"
+                    );
+                    match capture_screen_snapshot() {
+                        Ok(bytes) => (Response::bytes(200, "image/png", bytes), false),
+                        Err(spectacle_error) => (
+                            Response::json(
+                                500,
+                                &json_error(&format!(
+                                    "KWin ScreenShot2 failed: {kwin_error:#}; spectacle fallback also failed: {spectacle_error}"
+                                )),
+                            ),
+                            false,
+                        ),
+                    }
+                }
+            }
+        }
+        ("GET", "/api/live-capability") if authorized => (
+            Response::json(
+                200,
+                &serde_json::json!({
+                    "ok": true,
+                    "nativeLive": kwin_screenshot::is_kde_wayland(),
+                })
+                .to_string(),
+            ),
+            false,
+        ),
+        ("DELETE", "/api/live.mjpg") if authorized => {
+            LIVE_STREAM_STATE.store(2, Ordering::Release);
+            (
+                Response::json(200, r#"{"ok":true,"message":"Live stream stopped"}"#),
+                false,
+            )
         }
         ("POST", "/api/live-test") if authorized => {
             let resolution = match parse_live_test_resolution(&request.body) {
@@ -556,6 +705,8 @@ fn image_content_type(data: &[u8]) -> Option<&'static str> {
         Some("image/webp")
     } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
         Some("image/gif")
+    } else if data.starts_with(b"BM") && data.len() > 54 {
+        Some("image/bmp")
     } else {
         None
     }
@@ -638,6 +789,56 @@ fn write_response(stream: &mut TcpStream, response: Response) -> io::Result<()> 
 
 fn json_error(message: &str) -> String {
     serde_json::json!({ "ok": false, "error": message }).to_string()
+}
+
+/// Grab a full-desktop frame with Spectacle for calibration backgrounds.
+///
+/// The WebKit live-capture path depends on the xdg-desktop-portal ScreenCast
+/// backend, which fails on some Plasma setups ("target not found"); a
+/// compositor screenshot is deterministic and needs no portal at all.
+fn capture_screen_snapshot() -> Result<Vec<u8>, String> {
+    let path = env::temp_dir().join(format!("wroid-editor-snapshot-{}.png", std::process::id()));
+    let _ = fs::remove_file(&path);
+    eprintln!("[snapshot] running spectacle -> {}", path.display());
+    let output = Command::new("spectacle")
+        .args(["-b", "-n", "-f", "-o"])
+        .arg(&path)
+        .output()
+        .map_err(|error| {
+            let detail = format!("could not run spectacle: {error}");
+            eprintln!("[snapshot] {detail}");
+            detail
+        })?;
+    eprintln!(
+        "[snapshot] spectacle exit={:?} stderr={:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        let detail = format!(
+            "spectacle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!("[snapshot] {detail}");
+        return Err(detail);
+    }
+    // Spectacle may return while the file is still being flushed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs::read(&path) {
+            Ok(bytes) if bytes.starts_with(b"\x89PNG") => {
+                let _ = fs::remove_file(&path);
+                return Ok(bytes);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not read snapshot: {error}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("spectacle did not produce a screenshot in time".to_owned());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {

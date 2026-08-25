@@ -92,10 +92,21 @@ pub enum HostKeyName {
     Down = 43,
     Right = 44,
     Esc = 45,
+    F1 = 46,
+    F2 = 47,
+    F3 = 48,
+    F4 = 49,
+    F5 = 50,
+    F6 = 51,
+    F7 = 52,
+    F8 = 53,
+    F9 = 54,
+    F10 = 55,
+    F11 = 56,
 }
 
 impl HostKeyName {
-    const PROFILE_NAMES: [(&'static str, Self); 46] = [
+    const PROFILE_NAMES: [(&'static str, Self); 57] = [
         ("0", Self::Num0),
         ("1", Self::Num1),
         ("2", Self::Num2),
@@ -142,6 +153,17 @@ impl HostKeyName {
         ("down", Self::Down),
         ("right", Self::Right),
         ("esc", Self::Esc),
+        ("f1", Self::F1),
+        ("f2", Self::F2),
+        ("f3", Self::F3),
+        ("f4", Self::F4),
+        ("f5", Self::F5),
+        ("f6", Self::F6),
+        ("f7", Self::F7),
+        ("f8", Self::F8),
+        ("f9", Self::F9),
+        ("f10", Self::F10),
+        ("f11", Self::F11),
     ];
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -915,6 +937,7 @@ mod tests {
             "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f", "g",
             "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x",
             "y", "z", "space", "tab", "shift", "ctrl", "alt", "up", "left", "down", "right", "esc",
+            "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11",
         ];
         for (index, name) in known_names.into_iter().enumerate() {
             let key = HostKeyName::parse(name).unwrap();

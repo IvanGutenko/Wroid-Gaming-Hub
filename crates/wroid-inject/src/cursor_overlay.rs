@@ -1,19 +1,19 @@
-//! Wayland cursor overlay for UI-cursor mode inside nested Gamescope.
+//! Wayland cursor overlay for UI-cursor mode on the desktop compositor.
 //!
 //! Creates a transparent, fullscreen `zwlr_layer_shell_v1` overlay surface on
-//! the Gamescope nested compositor. The overlay carries no keyboard
-//! interactivity and toggles between two input states:
+//! the **desktop** Wayland display (KWin and friends), above the fullscreen
+//! Gamescope window. The session-drawn virtual cursor sprite is rendered by
+//! the desktop compositor: Gamescope's nested server accepts layer-shell
+//! surfaces at the protocol level but never composites them into its output,
+//! so a sprite inside Gamescope is invisible no matter how correctly its
+//! buffers are committed.
 //!
-//! * **enabled (UI mode):** `set_input_region(None)` → infinite input region.
-//!   The overlay receives `wl_pointer` motion/button events with absolute,
-//!   surface-relative coordinates. Those are emitted as [`CursorEvent`]s and
-//!   translated by the game session into Android touchscreen events.
-//! * **disabled (aim / OS-release):** an empty `wl_region` is installed as the
-//!   input region, so the overlay is input-invisible and every pointer event
-//!   passes through to the game window below.
-//!
-//! The overlay never injects input itself; it only reports cursor events to
-//! the main session loop through the `emit` callback.
+//! The surface is always input-transparent (empty input region, no keyboard
+//! interactivity): the session grabs the physical mouse itself and drives the
+//! sprite from raw evdev deltas, so the overlay must never intercept desktop
+//! input. `wl_pointer` events remain a secondary source and are emitted as
+//! [`CursorEvent`]s for compositors that deliver them while the mouse is not
+//! grabbed.
 
 use std::fs::File;
 use std::io;
@@ -25,20 +25,26 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-    wl_surface,
+    wl_buffer, wl_compositor, wl_output, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm,
+    wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 /// Linux input event code for the left mouse button (`BTN_LEFT`).
 const BTN_LEFT: u32 = 0x110;
-/// Timeout for control commands sent to the overlay thread.
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Poll timeout (ms) for the Wayland event loop so commands are noticed.
-const POLL_TIMEOUT_MS: i32 = 50;
+// A short poll keeps queued sprite commands latency low; the thread sleeps
+// in the kernel between ticks, so this is not a busy loop.
+const POLL_TIMEOUT_MS: i32 = 5;
 /// Timeout for the overlay startup handshake.
-const READY_TIMEOUT: Duration = Duration::from_secs(5);
+// The overlay maps during the Waydroid boot storm (LXC start, Android boot,
+// package launch, gamescope FSR init), when the desktop compositor can stall
+// surface configuration for seconds at a time. A tight deadline here used to
+// disable the UI cursor for whole sessions.
+const READY_TIMEOUT: Duration = Duration::from_secs(20);
+/// One presented frame, one compositor-retained frame, and one writable frame.
+const SPRITE_BUFFER_COUNT: usize = 3;
 
 /// Classic left-leaning arrow cursor sprite, `X` = black outline, `o` = white
 /// fill, `.` = transparent. Blitted directly into the overlay surface's
@@ -92,10 +98,6 @@ pub enum CursorEvent {
 
 /// Commands sent from the session thread to the overlay thread.
 enum CursorOverlayCommand {
-    SetEnabled {
-        enabled: bool,
-        reply: Sender<io::Result<()>>,
-    },
     /// Move or hide the session-drawn cursor sprite. The virtual cursor is
     /// rendered by the overlay itself because Gamescope's nested (xdg)
     /// backend implements neither host cursor control nor pointer delivery
@@ -104,7 +106,6 @@ enum CursorOverlayCommand {
         visible: bool,
         x: f64,
         y: f64,
-        reply: Sender<io::Result<()>>,
     },
     Stop,
 }
@@ -116,9 +117,18 @@ pub struct CursorOverlay {
 }
 
 impl CursorOverlay {
-    /// Spawn the overlay thread, connect to the nested Gamescope Wayland
-    /// display, and block until the overlay is mapped (or fails).
-    pub fn spawn<F>(runtime_dir: &Path, display: &str, enabled: bool, emit: F) -> io::Result<Self>
+    /// Spawn the overlay thread, connect to the desktop Wayland display, and
+    /// block until the overlay is mapped (or fails).
+    ///
+    /// `output_name` anchors the overlay to the output with that
+    /// `wl_output.name` (the KWin focus relay reports the game window's
+    /// output); `None` lets the compositor pick an output.
+    pub fn spawn<F>(
+        runtime_dir: &Path,
+        display: &str,
+        output_name: Option<&str>,
+        emit: F,
+    ) -> io::Result<Self>
     where
         F: Fn(CursorEvent) + Send + 'static,
     {
@@ -126,12 +136,20 @@ impl CursorOverlay {
         let (ready_tx, ready_rx) = mpsc::channel();
         let runtime_dir = runtime_dir.to_path_buf();
         let display = display.to_string();
+        let output_name = output_name.map(str::to_owned);
         let emit: Box<dyn Fn(CursorEvent) + Send> = Box::new(emit);
 
         let thread = thread::Builder::new()
             .name("wroid-cursor-overlay".into())
             .spawn(move || {
-                run_overlay(runtime_dir, display, enabled, control_rx, emit, ready_tx)
+                run_overlay(
+                    runtime_dir,
+                    display,
+                    output_name,
+                    control_rx,
+                    emit,
+                    ready_tx,
+                )
             })?;
 
         match ready_rx.recv_timeout(READY_TIMEOUT) {
@@ -156,41 +174,22 @@ impl CursorOverlay {
         })
     }
 
-    /// Enable or disable the overlay input region.
-    ///
-    /// `true` makes the overlay receive pointer events (UI mode); `false`
-    /// makes it input-transparent (aim / OS-release).
-    pub fn set_enabled(&self, enabled: bool) -> io::Result<()> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.control
-            .send(CursorOverlayCommand::SetEnabled {
-                enabled,
-                reply: reply_tx,
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "overlay thread stopped"))?;
-        reply_rx
-            .recv_timeout(CONTROL_TIMEOUT)
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "overlay control timeout"))?
-    }
-
     /// Position the session-drawn cursor sprite, or hide it.
     ///
     /// Coordinates are surface-local pixels of the overlay surface. The
-    /// sprite is only drawn while visible; hidden state re-attaches the
-    /// transparent 1x1 buffer so the surface stays mapped.
-    pub fn set_cursor(&self, visible: bool, x: f64, y: f64) -> io::Result<()> {
-        let (reply_tx, reply_rx) = mpsc::channel();
+    /// sprite is only drawn while visible; hidden state commits a transparent
+    /// full-surface frame so the layer surface stays mapped.
+    /// Queue a sprite update without waiting for the overlay thread.
+    ///
+    /// Sprite motion happens on the session's input hot path: blocking here
+    /// on an overlay round-trip throttled every mouse batch to the overlay
+    /// poll interval and built up tens of seconds of input backlog. The
+    /// overlay coalesces to the latest queued position anyway, so delivery
+    /// order matters more than confirmation.
+    pub fn set_cursor_async(&self, visible: bool, x: f64, y: f64) -> io::Result<()> {
         self.control
-            .send(CursorOverlayCommand::SetCursor {
-                visible,
-                x,
-                y,
-                reply: reply_tx,
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "overlay thread stopped"))?;
-        reply_rx
-            .recv_timeout(CONTROL_TIMEOUT)
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "overlay control timeout"))?
+            .send(CursorOverlayCommand::SetCursor { visible, x, y })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "overlay thread stopped"))
     }
 }
 
@@ -205,7 +204,6 @@ impl Drop for CursorOverlay {
 
 /// Mutable state shared across the overlay's `Dispatch` implementations.
 struct OverlayState {
-    enabled: bool,
     configured_size: Option<(u32, u32)>,
     compositor: Option<wl_compositor::WlCompositor>,
     seat: Option<wl_seat::WlSeat>,
@@ -214,17 +212,24 @@ struct OverlayState {
     surface: Option<wl_surface::WlSurface>,
     layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
     pointer: Option<wl_pointer::WlPointer>,
+    /// Bound outputs with their `wl_output.name`, used to anchor the layer
+    /// surface to the game window's output.
+    outputs: Vec<(wl_output::WlOutput, Option<String>)>,
     /// Full-surface sprite buffers; the arrow is blitted into them at the
     /// requested position because `wl_surface.attach` forbids nonzero
     /// offsets at version >= 5, so the sprite cannot move via attach.
-    sprite_buffers: [Option<wl_buffer::WlBuffer>; 2],
+    sprite_buffers: [Option<wl_buffer::WlBuffer>; SPRITE_BUFFER_COUNT],
     /// Surface size the sprite buffers were created for; drawing is skipped
     /// when the compositor reconfigures a different size.
     sprite_buffer_size: Option<(i32, i32)>,
     sprite_stride: i32,
     /// Arrow tip currently blitted into each sprite buffer.
-    sprite_drawn: [Option<(i32, i32)>; 2],
-    sprite_index: usize,
+    sprite_drawn: [Option<(i32, i32)>; SPRITE_BUFFER_COUNT],
+    sprite_slots: SpriteBufferSlots,
+    /// Last cursor image submitted to the compositor. `None` means no sprite
+    /// buffer has been committed yet; `Some(None)` is a committed transparent
+    /// frame.
+    committed_cursor: Option<Option<(i32, i32)>>,
     sprite_pixels: Option<SpritePixels>,
     pending_cursor_visible: bool,
     pending_cursor_x: i32,
@@ -243,6 +248,37 @@ struct OverlayState {
 struct SpritePixels {
     pointer: *mut u8,
     length: usize,
+}
+
+/// Tracks which shared-memory buffers the compositor still owns.
+///
+/// Wayland clients may only mutate a buffer after `wl_buffer.release`. Cursor
+/// motion can arrive faster than the compositor presents frames, so the latest
+/// requested position is kept in `OverlayState` until a slot becomes free.
+#[derive(Default)]
+struct SpriteBufferSlots {
+    busy: [bool; SPRITE_BUFFER_COUNT],
+    next: usize,
+}
+
+impl SpriteBufferSlots {
+    fn acquire(&mut self) -> Option<usize> {
+        for offset in 0..self.busy.len() {
+            let index = (self.next + offset) % self.busy.len();
+            if !self.busy[index] {
+                self.busy[index] = true;
+                self.next = (index + 1) % self.busy.len();
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn release(&mut self, index: usize) {
+        if let Some(busy) = self.busy.get_mut(index) {
+            *busy = false;
+        }
+    }
 }
 
 impl SpritePixels {
@@ -284,7 +320,7 @@ impl Drop for SpritePixels {
 fn run_overlay(
     runtime_dir: PathBuf,
     display: String,
-    enabled: bool,
+    output_name: Option<String>,
     commands: Receiver<CursorOverlayCommand>,
     emit: Box<dyn Fn(CursorEvent) + Send>,
     ready: Sender<io::Result<()>>,
@@ -293,7 +329,7 @@ fn run_overlay(
     let stream = UnixStream::connect(&socket_path).map_err(|e| {
         io::Error::new(
             e.kind(),
-            format!("connect nested display {socket_path:?}: {e}"),
+            format!("connect desktop display {socket_path:?}: {e}"),
         )
     })?;
     let connection = Connection::from_socket(stream)
@@ -301,7 +337,6 @@ fn run_overlay(
 
     let mut event_queue: EventQueue<OverlayState> = connection.new_event_queue();
     let mut state = OverlayState {
-        enabled,
         configured_size: None,
         compositor: None,
         seat: None,
@@ -310,11 +345,13 @@ fn run_overlay(
         surface: None,
         layer_surface: None,
         pointer: None,
-        sprite_buffers: [None, None],
+        outputs: Vec::new(),
+        sprite_buffers: std::array::from_fn(|_| None),
         sprite_buffer_size: None,
         sprite_stride: 0,
-        sprite_drawn: [None, None],
-        sprite_index: 0,
+        sprite_drawn: [None; SPRITE_BUFFER_COUNT],
+        sprite_slots: SpriteBufferSlots::default(),
+        committed_cursor: None,
         sprite_pixels: None,
         pending_cursor_visible: false,
         pending_cursor_x: 0,
@@ -353,7 +390,25 @@ fn run_overlay(
         ));
     }
 
-    // Create the fullscreen overlay surface.
+    // Create the fullscreen overlay surface, anchored to the game window's
+    // output when the session could name one. Output name events arrive only
+    // after their bind, so dispatch one more roundtrip first.
+    event_queue
+        .roundtrip(&mut state)
+        .map_err(|e| io::Error::other(format!("output roundtrip: {e}")))?;
+    let anchored_output = output_name.as_deref().and_then(|wanted| {
+        state
+            .outputs
+            .iter()
+            .find(|(_, name)| name.as_deref() == Some(wanted))
+            .map(|(output, _)| output.clone())
+    });
+    if output_name.is_some() && anchored_output.is_none() {
+        eprintln!(
+            "Cursor overlay: output {output_name:?} not found among the desktop outputs; letting \
+             the compositor pick one."
+        );
+    }
     let compositor = state
         .compositor
         .clone()
@@ -365,13 +420,16 @@ fn run_overlay(
     let surface = compositor.create_surface(&event_queue.handle(), ());
     let layer_surface = layer_shell.get_layer_surface(
         &surface,
-        None,
+        anchored_output.as_ref(),
         zwlr_layer_shell_v1::Layer::Overlay,
         "wroid-cursor-overlay".to_string(),
         &event_queue.handle(),
         (),
     );
     layer_surface.set_size(0, 0);
+    // Cover the whole output, ignoring panels' exclusive zones, so the sprite
+    // coordinate space matches the fullscreen game pixel-for-pixel.
+    layer_surface.set_exclusive_zone(-1);
     layer_surface.set_anchor(
         zwlr_layer_surface_v1::Anchor::Top
             | zwlr_layer_surface_v1::Anchor::Bottom
@@ -407,19 +465,22 @@ fn run_overlay(
     }
 
     // Map the surface with the first (still fully transparent) sprite buffer
-    // and prepare both sprite buffers for the session-drawn virtual cursor.
+    // and prepare the sprite buffers for the session-drawn virtual cursor.
     create_sprite_buffers(&mut state, &event_queue.handle())?;
     let (surface_width, surface_height) = state
         .sprite_buffer_size
         .expect("sprite buffers require a configured size");
-    let surface = state
-        .surface
-        .as_ref()
-        .expect("surface created before buffers");
-    surface.attach(state.sprite_buffers[0].as_ref(), 0, 0);
-    surface.damage(0, 0, surface_width, surface_height);
-    surface.commit();
-    // Apply the initial input region.
+    let initial_index = state
+        .sprite_slots
+        .acquire()
+        .expect("new sprite pool has a free buffer");
+    if let Some(surface) = state.surface.as_ref() {
+        surface.attach(state.sprite_buffers[initial_index].as_ref(), 0, 0);
+        surface.damage(0, 0, surface_width, surface_height);
+        surface.commit();
+        state.committed_cursor = Some(None);
+    }
+    // Stay input-transparent for the whole session lifetime.
     apply_input_region(&mut state, &event_queue.handle());
 
     if let Some(r) = state.ready.take() {
@@ -446,10 +507,11 @@ fn create_memfd(name: &[u8], size: usize) -> io::Result<File> {
     Ok(file)
 }
 
-/// Build the cursor sprite buffers: two full-surface ARGB8888 copies sharing
-/// one shm pool. Both start fully transparent (fresh memfd pages are
+/// Build the cursor sprite buffers: three full-surface ARGB8888 copies sharing
+/// one shm pool. They start fully transparent (fresh memfd pages are
 /// zero-filled) and the arrow is blitted into whichever copy is committed
-/// next; alternating the two defeats Gamescope's identical-buffer dedupe.
+/// next. The third copy lets the client submit a new position while Gamescope
+/// still retains the current and previous frames.
 fn create_sprite_buffers(
     state: &mut OverlayState,
     qh: &QueueHandle<OverlayState>,
@@ -476,28 +538,28 @@ fn create_sprite_buffers(
         .checked_mul(height)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer size overflow"))?;
     let pool_size = frame
-        .checked_mul(2)
+        .checked_mul(SPRITE_BUFFER_COUNT as i32)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pool size overflow"))?;
 
     let memfd = create_memfd(b"wroid-cursor-sprite\0", pool_size as usize)?;
     let pixels = SpritePixels::map(&memfd, pool_size as usize)?;
     let pool = shm.create_pool(memfd.as_fd(), pool_size, qh, ());
-    let first = pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, qh, ());
-    let second = pool.create_buffer(
-        frame,
-        width,
-        height,
-        stride,
-        wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
-
-    state.sprite_buffers = [Some(first), Some(second)];
+    state.sprite_buffers = std::array::from_fn(|index| {
+        Some(pool.create_buffer(
+            frame * index as i32,
+            width,
+            height,
+            stride,
+            wl_shm::Format::Argb8888,
+            qh,
+            index,
+        ))
+    });
     state.sprite_buffer_size = Some((width, height));
     state.sprite_stride = stride;
-    state.sprite_drawn = [None, None];
-    state.sprite_index = 0;
+    state.sprite_drawn = [None; SPRITE_BUFFER_COUNT];
+    state.sprite_slots = SpriteBufferSlots::default();
+    state.committed_cursor = None;
     state.sprite_pixels = Some(pixels);
     state._cursor_memfd = Some(memfd);
     Ok(())
@@ -539,32 +601,76 @@ fn draw_cursor(state: &mut OverlayState) {
         .clamp(0, height.saturating_sub(CURSOR_HEIGHT));
     let drawn = state.pending_cursor_visible.then_some((new_x, new_y));
 
-    state.sprite_index ^= 1;
-    let index = state.sprite_index;
-    let old_rect = state.sprite_drawn[index];
-    if old_rect == drawn {
-        // This buffer already shows exactly that; nothing to commit.
+    if state.committed_cursor == Some(drawn) {
         return;
     }
+    // KWin (and other compositors with partial texture updates) repaint the
+    // surface texture only inside the committed damage region. The sprite
+    // previously visible on the surface lives in whichever buffer was
+    // committed last — not necessarily the one about to be reused — so both
+    // that position and this slot's own stale arrow must be damaged or the
+    // old sprite ghosts on screen forever.
+    let committed_rect = state.committed_cursor.unwrap_or(None);
+    let Some(index) = state.sprite_slots.acquire() else {
+        // All buffers are still in use. The newest requested cursor state
+        // remains pending and will be drawn when a release event arrives.
+        return;
+    };
+    let old_rect = state.sprite_drawn[index];
 
     if let Some(pixels) = state.sprite_pixels.as_mut() {
-        let bytes = pixels.as_mut_slice();
-        clear_sprite_rect(bytes, state.sprite_stride, old_rect);
-        if let Some((x, y)) = drawn {
-            blit_arrow(bytes, state.sprite_stride, x, y);
-        }
+        paint_sprite_frame(
+            pixels.as_mut_slice(),
+            state.sprite_stride,
+            height,
+            index,
+            old_rect,
+            drawn,
+        );
     }
     state.sprite_drawn[index] = drawn;
 
     if let Some(buffer) = state.sprite_buffers[index].as_ref() {
         surface.attach(Some(buffer), 0, 0);
-        if let Some((x, y)) = old_rect {
-            surface.damage(x, y, CURSOR_WIDTH, CURSOR_HEIGHT);
-        }
-        if let Some((x, y)) = drawn {
+        for rect in [committed_rect, old_rect, drawn].into_iter().flatten() {
+            let (x, y) = rect;
             surface.damage(x, y, CURSOR_WIDTH, CURSOR_HEIGHT);
         }
         surface.commit();
+        state.committed_cursor = Some(drawn);
+    } else {
+        state.sprite_slots.release(index);
+    }
+}
+
+/// Update one full-surface frame in the shared sprite-buffer pool.
+fn paint_sprite_frame(
+    bytes: &mut [u8],
+    stride: i32,
+    height: i32,
+    index: usize,
+    old_rect: Option<(i32, i32)>,
+    drawn: Option<(i32, i32)>,
+) {
+    let Some(frame_len) = stride
+        .checked_mul(height)
+        .and_then(|length| usize::try_from(length).ok())
+    else {
+        return;
+    };
+    let Some(start) = frame_len.checked_mul(index) else {
+        return;
+    };
+    let Some(end) = start.checked_add(frame_len) else {
+        return;
+    };
+    let Some(frame) = bytes.get_mut(start..end) else {
+        return;
+    };
+
+    clear_sprite_rect(frame, stride, old_rect);
+    if let Some((x, y)) = drawn {
+        blit_arrow(frame, stride, x, y);
     }
 }
 
@@ -607,23 +713,20 @@ fn blit_arrow(bytes: &mut [u8], stride: i32, x: i32, y: i32) {
     }
 }
 
-/// Install the input region matching the current `enabled` flag and commit.
+/// Install the empty input region that keeps the overlay input-transparent.
+///
+/// The session grabs the physical mouse itself; the overlay is a pure
+/// renderer and must never intercept desktop input.
 fn apply_input_region(state: &mut OverlayState, qh: &QueueHandle<OverlayState>) {
     let Some(surface) = state.surface.as_ref() else {
         return;
     };
-    if state.enabled {
-        // Infinite input region: the overlay receives all pointer events.
-        surface.set_input_region(None);
-    } else {
-        // Empty input region: the overlay is input-transparent.
-        let Some(compositor) = state.compositor.as_ref() else {
-            return;
-        };
-        let region = compositor.create_region(qh, ());
-        surface.set_input_region(Some(&region));
-        region.destroy();
-    }
+    let Some(compositor) = state.compositor.as_ref() else {
+        return;
+    };
+    let region = compositor.create_region(qh, ());
+    surface.set_input_region(Some(&region));
+    region.destroy();
     surface.commit();
 }
 
@@ -641,22 +744,11 @@ fn event_loop(
         // Drain pending control commands.
         loop {
             match commands.try_recv() {
-                Ok(CursorOverlayCommand::SetEnabled { enabled, reply }) => {
-                    state.enabled = enabled;
-                    apply_input_region(state, &event_queue.handle());
-                    let _ = reply.send(Ok(()));
-                }
-                Ok(CursorOverlayCommand::SetCursor {
-                    visible,
-                    x,
-                    y,
-                    reply,
-                }) => {
+                Ok(CursorOverlayCommand::SetCursor { visible, x, y }) => {
                     state.pending_cursor_visible = visible;
                     state.pending_cursor_x = x as i32;
                     state.pending_cursor_y = y as i32;
                     draw_cursor(state);
-                    let _ = reply.send(Ok(()));
                 }
                 Ok(CursorOverlayCommand::Stop) => return Ok(()),
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -723,6 +815,14 @@ impl Dispatch<wl_registry::WlRegistry, ()> for OverlayState {
                     let version = version.min(5);
                     state.compositor = Some(registry.bind(name, version, qh, ()));
                 }
+                "wl_output" => {
+                    // Version 4 carries the `name` event used to anchor the
+                    // overlay to a specific output.
+                    let version = version.min(4);
+                    state
+                        .outputs
+                        .push((registry.bind(name, version, qh, ()), None));
+                }
                 "wl_seat" => {
                     let version = version.min(9);
                     state.seat = Some(registry.bind(name, version, qh, ()));
@@ -778,6 +878,23 @@ impl Dispatch<wl_seat::WlSeat, ()> for OverlayState {
     }
 }
 
+impl Dispatch<wl_output::WlOutput, ()> for OverlayState {
+    fn event(
+        state: &mut Self,
+        output: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Name { name } = event {
+            if let Some((_, slot)) = state.outputs.iter_mut().find(|(bound, _)| bound == output) {
+                *slot = Some(name);
+            }
+        }
+    }
+}
+
 impl Dispatch<wl_shm::WlShm, ()> for OverlayState {
     fn event(
         _state: &mut Self,
@@ -802,15 +919,19 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for OverlayState {
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, ()> for OverlayState {
+impl Dispatch<wl_buffer::WlBuffer, usize> for OverlayState {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &wl_buffer::WlBuffer,
-        _event: wl_buffer::Event,
-        _data: &(),
+        event: wl_buffer::Event,
+        index: &usize,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        if let wl_buffer::Event::Release = event {
+            state.sprite_slots.release(*index);
+            draw_cursor(state);
+        }
     }
 }
 
@@ -978,5 +1099,72 @@ mod tests {
         clear_sprite_rect(&mut bytes, stride, Some((10, 20)));
         assert_eq!(pixel(&bytes, 10, 20), CURSOR_TRANSPARENT);
         assert_eq!(pixel(&bytes, 11, 22), CURSOR_TRANSPARENT);
+    }
+
+    #[test]
+    fn sprite_paint_targets_the_selected_shm_frame() {
+        let width = 64;
+        let height = 64;
+        let stride = width * 4;
+        let frame_len = (stride * height) as usize;
+        let mut bytes = vec![0_u8; frame_len * SPRITE_BUFFER_COUNT];
+
+        paint_sprite_frame(&mut bytes, stride, height, 2, None, Some((10, 20)));
+
+        assert!(bytes[..frame_len * 2].iter().all(|byte| *byte == 0));
+        let pixel_start = frame_len * 2 + (20 * stride + 10 * 4) as usize;
+        assert_eq!(
+            u32::from_ne_bytes(bytes[pixel_start..pixel_start + 4].try_into().unwrap()),
+            CURSOR_OUTLINE
+        );
+    }
+
+    #[test]
+    fn sprite_buffers_are_not_reused_before_release() {
+        let mut slots = SpriteBufferSlots::default();
+
+        // Gamescope may retain the previous frame while presenting the
+        // current one. The startup transparent frame and the first visible
+        // frame must therefore leave a third writable slot for the first
+        // actual mouse movement.
+        assert_eq!(slots.acquire(), Some(0));
+        assert_eq!(slots.acquire(), Some(1));
+        assert_eq!(slots.acquire(), Some(2));
+        assert_eq!(slots.acquire(), None);
+
+        slots.release(0);
+        assert_eq!(slots.acquire(), Some(0));
+    }
+
+    #[test]
+    #[ignore = "requires a live desktop Wayland session; verify with screenshots"]
+    fn live_desktop_overlay_presents_movable_sprite() {
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .expect("XDG_RUNTIME_DIR is set in a desktop session");
+        let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".to_owned());
+        let (events_tx, events_rx) = mpsc::channel();
+        let overlay = CursorOverlay::spawn(&runtime_dir, &display, None, move |event| {
+            let _ = events_tx.send(event);
+        })
+        .expect("overlay maps on the desktop compositor");
+
+        // Hold each position long enough for out-of-band screenshot checks:
+        // the arrow must be composited at the requested surface-local
+        // coordinates and must move between phases.
+        for (x, y) in [(960.0, 540.0), (400.0, 300.0)] {
+            overlay
+                .set_cursor_async(true, x, y)
+                .expect("cursor command");
+            thread::sleep(Duration::from_secs(4));
+        }
+        overlay
+            .set_cursor_async(false, 0.0, 0.0)
+            .expect("hide command");
+        drop(overlay);
+
+        // Compositor pointer delivery is a secondary source; an empty input
+        // region must keep it silent so the overlay never steals input.
+        assert!(events_rx.try_recv().is_err());
     }
 }

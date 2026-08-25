@@ -6,11 +6,20 @@
   "bindings": [
     {
       "name": "movement",
-      "input": { "kind": "key_cluster", "up": "w", "left": "a", "down": "s", "right": "d" },
+      "input": {
+        "kind": "key_cluster",
+        "up": "w",
+        "left": "a",
+        "down": "s",
+        "right": "d"
+      },
       "action": {
         "kind": "virtual_joystick",
-        "center": { "x": 0.16, "y": 0.76 },
-        "radius": 0.10,
+        "center": {
+          "x": 0.16,
+          "y": 0.76
+        },
+        "radius": 0.1,
         "dead_zone": 0.02,
         "mode": "hold",
         "reaffirm_ms": 50
@@ -18,13 +27,19 @@
     },
     {
       "name": "camera",
-      "input": { "kind": "mouse_move" },
+      "input": {
+        "kind": "mouse_move"
+      },
       "action": {
         "kind": "mouse_aim",
-        "region": { "x": 0.38, "y": 0.08, "w": 0.56, "h": 0.70 },
+        "region": {
+          "x": 0.55,
+          "y": 0.15,
+          "w": 0.25,
+          "h": 0.6
+        },
         "sensitivity": 1.15,
-        "toggle_key": "tab",
-        "recenter_threshold": 0.70,
+        "recenter_threshold": 0.5,
         "recenter_gap_ms": 0,
         "ads_multiplier": 0.62,
         "reaffirm_ms": 50
@@ -32,43 +47,115 @@
     },
     {
       "name": "fire",
-      "input": { "kind": "mouse_button", "button": "left" },
-      "action": { "kind": "hold", "point": { "x": 0.91, "y": 0.47 } }
+      "input": {
+        "kind": "mouse_button",
+        "button": "left"
+      },
+      "action": {
+        "kind": "hold",
+        "point": {
+          "x": 0.91,
+          "y": 0.47
+        }
+      }
     },
     {
       "name": "aim_down_sights",
-      "input": { "kind": "mouse_button", "button": "right" },
-      "action": { "kind": "tap", "point": { "x": 0.84, "y": 0.39 } }
+      "input": {
+        "kind": "mouse_button",
+        "button": "right"
+      },
+      "action": {
+        "kind": "tap",
+        "point": {
+          "x": 0.84,
+          "y": 0.39
+        }
+      }
     },
     {
       "name": "reload",
-      "input": { "kind": "key", "key": "r" },
-      "action": { "kind": "tap", "point": { "x": 0.88, "y": 0.67 } }
+      "input": {
+        "kind": "key",
+        "key": "r"
+      },
+      "action": {
+        "kind": "tap",
+        "point": {
+          "x": 0.88,
+          "y": 0.67
+        }
+      }
     },
     {
       "name": "jump",
-      "input": { "kind": "key", "key": "space" },
-      "action": { "kind": "tap", "point": { "x": 0.81, "y": 0.58 } }
+      "input": {
+        "kind": "key",
+        "key": "space"
+      },
+      "action": {
+        "kind": "tap",
+        "point": {
+          "x": 0.81,
+          "y": 0.58
+        }
+      }
     },
     {
       "name": "crouch",
-      "input": { "kind": "key", "key": "c" },
-      "action": { "kind": "tap", "point": { "x": 0.76, "y": 0.76 } }
+      "input": {
+        "kind": "key",
+        "key": "c"
+      },
+      "action": {
+        "kind": "tap",
+        "point": {
+          "x": 0.76,
+          "y": 0.76
+        }
+      }
     },
     {
       "name": "primary_weapon",
-      "input": { "kind": "key", "key": "1" },
-      "action": { "kind": "tap", "point": { "x": 0.89, "y": 0.18 } }
+      "input": {
+        "kind": "key",
+        "key": "1"
+      },
+      "action": {
+        "kind": "tap",
+        "point": {
+          "x": 0.89,
+          "y": 0.18
+        }
+      }
     },
     {
       "name": "secondary_weapon",
-      "input": { "kind": "key", "key": "2" },
-      "action": { "kind": "tap", "point": { "x": 0.79, "y": 0.18 } }
+      "input": {
+        "kind": "key",
+        "key": "2"
+      },
+      "action": {
+        "kind": "tap",
+        "point": {
+          "x": 0.79,
+          "y": 0.18
+        }
+      }
     },
     {
       "name": "action",
-      "input": { "kind": "key", "key": "f" },
-      "action": { "kind": "tap", "point": { "x": 0.60, "y": 0.57 } }
+      "input": {
+        "kind": "key",
+        "key": "f"
+      },
+      "action": {
+        "kind": "tap",
+        "point": {
+          "x": 0.6,
+          "y": 0.57
+        }
+      }
     }
   ]
 }

@@ -180,6 +180,15 @@ fn application_flags(spec: NativeAppSpec) -> ApplicationFlags {
 fn configure_webview(webview: &WebView, origin: &LocalOrigin) {
     if let Some(settings) = WebViewExt::settings(webview) {
         settings.set_enable_developer_extras(cfg!(debug_assertions));
+        // navigator.mediaDevices.getDisplayMedia (the controls editor's live
+        // window capture) only exists when the WebKit media-stream setting is
+        // enabled; without it the capture button reports an unsupported
+        // browser.
+        settings.set_enable_media_stream(true);
+        // The controls editor has no devtools in release builds; surface its
+        // JavaScript console (capture failures, portal errors) on the hub
+        // process stderr so window-capture misbehavior is diagnosable.
+        settings.set_enable_write_console_messages_to_stdout(true);
     }
     webview.connect_create(|_, _| None);
     webview.connect_context_menu(|_, _, _, _| true);

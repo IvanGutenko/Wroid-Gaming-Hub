@@ -433,6 +433,10 @@ impl MouseAimController {
             return Ok(MouseAimUpdate::Ignored);
         }
         let contact_id = self.aim.contact_id;
+        trace_aim(format!(
+            "activate contact={contact_id:?} origin=({},{})",
+            self.aim.origin.x, self.aim.origin.y
+        ));
         engine.begin_contact(contact_id, self.aim.origin)?;
         self.active_contact_id = Some(contact_id);
         self.next_contact_id = self.settings.alternate_contact_id;
@@ -473,19 +477,30 @@ impl MouseAimController {
 
         let (dx, dy) = self.scaled_delta(delta);
         if let Some(pending) = &mut self.pending_recenter {
+            trace_aim(format!(
+                "move during pending recenter: accumulate ({dx},{dy})"
+            ));
             pending.dx = pending.dx.saturating_add(dx);
             pending.dy = pending.dy.saturating_add(dy);
             return self.tick(engine, now);
         }
 
         let Some(contact_id) = self.active_contact_id else {
+            trace_aim("move ignored: no active contact".to_owned());
             return Ok(MouseAimUpdate::Ignored);
         };
         let Some(current) = engine.state().position(contact_id) else {
+            trace_aim(format!(
+                "move ignored: contact {contact_id:?} has no position"
+            ));
             return Ok(MouseAimUpdate::Ignored);
         };
         let target = self.aim.region.clamp(offset_point(current, dx, dy));
         if target == current {
+            trace_aim(format!(
+                "move ignored: clamped at edge, contact at ({},{})",
+                current.x, current.y
+            ));
             return Ok(MouseAimUpdate::Ignored);
         }
 
@@ -493,6 +508,10 @@ impl MouseAimController {
             return self.recenter(engine, contact_id, current, dx, dy, now);
         }
 
+        trace_aim(format!(
+            "move contact=({},{}) -> ({},{})",
+            current.x, current.y, target.x, target.y
+        ));
         engine.move_contact(contact_id, target)?;
         self.last_reaffirm_at = Some(now);
         Ok(MouseAimUpdate::Moved)
@@ -507,6 +526,10 @@ impl MouseAimController {
             if now < pending.ready_at {
                 return Ok(MouseAimUpdate::Ignored);
             }
+            trace_aim(format!(
+                "recenter fires: new contact down at ({},{}) residual=({},{})",
+                self.aim.origin.x, self.aim.origin.y, pending.dx, pending.dy
+            ));
             engine.begin_contact(pending.contact_id, self.aim.origin)?;
             self.active_contact_id = Some(pending.contact_id);
             self.next_contact_id = pending.previous_contact_id;
@@ -653,6 +676,12 @@ impl MouseAimController {
             engine.move_contact(contact_id, target)?;
         }
         Ok(())
+    }
+}
+
+fn trace_aim(message: String) {
+    if std::env::var_os("WROID_AIM_TRACE").is_some() {
+        eprintln!("[aim-trace] {message}");
     }
 }
 

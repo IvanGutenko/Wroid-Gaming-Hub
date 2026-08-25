@@ -31,10 +31,23 @@ pub fn presentation_for_game(
     width: u32,
     height: u32,
 ) -> WaydroidPresentation {
-    if launch_package && gamescope_available {
-        WaydroidPresentation::Gamescope { width, height }
-    } else {
-        WaydroidPresentation::Direct
+    // Direct presentation is the performance default: the Waydroid window is
+    // composited once by the desktop compositor and presents at the monitor's
+    // native refresh (measured 240 fps on a 240 Hz panel). The nested
+    // Gamescope pipeline adds a second composition pass plus an FSR shader,
+    // which costs frames, and its nested display reports a different refresh
+    // rate to Android, which lowers the in-game FPS-limit options. It stays
+    // available as an explicit opt-in for FSR upscaling scenarios.
+    match std::env::var("WROID_PRESENTATION").as_deref() {
+        Ok("direct") => WaydroidPresentation::Direct,
+        Ok("gamescope") => {
+            if launch_package && gamescope_available {
+                WaydroidPresentation::Gamescope { width, height }
+            } else {
+                WaydroidPresentation::Direct
+            }
+        }
+        _ => WaydroidPresentation::Direct,
     }
 }
 
@@ -44,7 +57,7 @@ pub fn gamescope_is_available() -> bool {
 }
 
 fn gamescope_arguments(width: u32, height: u32) -> Vec<OsString> {
-    vec![
+    let mut arguments = vec![
         OsString::from("-w"),
         OsString::from(width.to_string()),
         OsString::from("-h"),
@@ -66,11 +79,24 @@ fn gamescope_arguments(width: u32, height: u32) -> Vec<OsString> {
         OsString::from("fsr"),
         OsString::from("--sharpness"),
         OsString::from("5"),
+    ];
+    // Without `-r`, Gamescope's nested display reports its own default refresh
+    // rate to clients; Android then hides every in-game FPS limit above it
+    // (measured: a 240 Hz panel offered at most 120). `WROID_GAMESCOPE_REFRESH`
+    // pins the nested display to the host panel's rate.
+    if let Ok(refresh) = std::env::var("WROID_GAMESCOPE_REFRESH") {
+        if !refresh.is_empty() && refresh.chars().all(|c| c.is_ascii_digit()) {
+            arguments.push(OsString::from("-r"));
+            arguments.push(OsString::from(refresh));
+        }
+    }
+    arguments.extend([
         OsString::from("--"),
         OsString::from(WAYDROID_PATH),
         OsString::from("session"),
         OsString::from("start"),
-    ]
+    ]);
+    arguments
 }
 
 #[derive(Debug, Clone)]
@@ -1152,7 +1178,31 @@ mod tests {
     }
 
     #[test]
-    fn package_game_uses_fullscreen_presentation_when_gamescope_is_available() {
+    fn gamescope_arguments_append_refresh_rate_override() {
+        // SAFETY: single-threaded test body writing a test-only variable.
+        unsafe { std::env::set_var("WROID_GAMESCOPE_REFRESH", "240") };
+        let arguments = gamescope_arguments(1280, 720);
+        let position = arguments
+            .iter()
+            .position(|argument| argument == "--")
+            .expect("separator");
+        assert!(arguments[..position]
+            .windows(2)
+            .any(|pair| pair[0] == *"-r" && pair[1] == *"240"));
+        unsafe { std::env::remove_var("WROID_GAMESCOPE_REFRESH") };
+    }
+
+    #[test]
+    fn direct_presentation_is_the_default_and_gamescope_is_opt_in() {
+        // SAFETY: single-threaded test body writing a test-only variable.
+        unsafe { std::env::remove_var("WROID_PRESENTATION") };
+        // Performance default: no env override means Direct even when
+        // Gamescope could run.
+        assert_eq!(
+            presentation_for_game(true, true, 1280, 720),
+            WaydroidPresentation::Direct
+        );
+        unsafe { std::env::set_var("WROID_PRESENTATION", "gamescope") };
         assert_eq!(
             presentation_for_game(true, true, 1280, 720),
             WaydroidPresentation::Gamescope {
@@ -1168,6 +1218,12 @@ mod tests {
             presentation_for_game(true, false, 1280, 720),
             WaydroidPresentation::Direct
         );
+        unsafe { std::env::set_var("WROID_PRESENTATION", "direct") };
+        assert_eq!(
+            presentation_for_game(true, true, 1280, 720),
+            WaydroidPresentation::Direct
+        );
+        unsafe { std::env::remove_var("WROID_PRESENTATION") };
     }
 
     #[derive(Default)]

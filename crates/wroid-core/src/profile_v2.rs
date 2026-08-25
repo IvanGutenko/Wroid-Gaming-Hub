@@ -735,6 +735,20 @@ fn known_key_name(value: &str) -> bool {
             | "shift"
             | "ctrl"
             | "alt"
+            // F1–F11 are bindable; F12 is reserved for the session capture
+            // hotkey and is deliberately absent so profiles cannot bind a key
+            // the session intercepts before the runtime sees it.
+            | "f1"
+            | "f2"
+            | "f3"
+            | "f4"
+            | "f5"
+            | "f6"
+            | "f7"
+            | "f8"
+            | "f9"
+            | "f10"
+            | "f11"
             | "up"
             | "left"
             | "down"
@@ -1306,6 +1320,17 @@ mod tests {
             },
         });
 
+        profile.validate().unwrap();
+
+        {
+            let ActionV2::MouseAim {
+                ref mut toggle_key, ..
+            } = profile.bindings.last_mut().unwrap().action
+            else {
+                unreachable!()
+            };
+            *toggle_key = Some("f10".to_owned());
+        }
         profile.validate().unwrap();
 
         let ActionV2::MouseAim {

@@ -90,6 +90,17 @@ pub enum HostKey {
     ArrowLeft,
     ArrowDown,
     ArrowRight,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
     F12,
     Esc,
 }
@@ -142,6 +153,17 @@ impl HostKey {
             Self::ArrowLeft => "left",
             Self::ArrowDown => "down",
             Self::ArrowRight => "right",
+            Self::F1 => "f1",
+            Self::F2 => "f2",
+            Self::F3 => "f3",
+            Self::F4 => "f4",
+            Self::F5 => "f5",
+            Self::F6 => "f6",
+            Self::F7 => "f7",
+            Self::F8 => "f8",
+            Self::F9 => "f9",
+            Self::F10 => "f10",
+            Self::F11 => "f11",
             Self::F12 => "f12",
             Self::Esc => "esc",
         }
@@ -661,6 +683,17 @@ fn normalize_host_input_event(event: InputEvent) -> Option<HostKeyEvent> {
         KeyCode::KEY_LEFT => HostKey::ArrowLeft,
         KeyCode::KEY_DOWN => HostKey::ArrowDown,
         KeyCode::KEY_RIGHT => HostKey::ArrowRight,
+        KeyCode::KEY_F1 => HostKey::F1,
+        KeyCode::KEY_F2 => HostKey::F2,
+        KeyCode::KEY_F3 => HostKey::F3,
+        KeyCode::KEY_F4 => HostKey::F4,
+        KeyCode::KEY_F5 => HostKey::F5,
+        KeyCode::KEY_F6 => HostKey::F6,
+        KeyCode::KEY_F7 => HostKey::F7,
+        KeyCode::KEY_F8 => HostKey::F8,
+        KeyCode::KEY_F9 => HostKey::F9,
+        KeyCode::KEY_F10 => HostKey::F10,
+        KeyCode::KEY_F11 => HostKey::F11,
         KeyCode::KEY_F12 => HostKey::F12,
         KeyCode::KEY_ESC => HostKey::Esc,
         _ => return None,
@@ -692,6 +725,7 @@ mod tests {
         assert_eq!(HostKey::ArrowUp.profile_name(), "up");
         assert_eq!(HostKey::Num1.profile_name(), "1");
         assert_eq!(HostKey::F12.profile_name(), "f12");
+        assert_eq!(HostKey::F10.profile_name(), "f10");
         assert_eq!(HostKey::Esc.profile_name(), "esc");
     }
 

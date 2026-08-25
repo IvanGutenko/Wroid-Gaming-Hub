@@ -489,6 +489,23 @@ fn peer_executable(peer_pid: libc::pid_t, expected_uid: u32) -> Result<PathBuf, 
     }
     let proc_executable = PathBuf::from(format!("/proc/{peer_pid}/exe"));
     let executable = fs::read_link(&proc_executable)?;
+    // The kernel appends " (deleted)" to /proc/<pid>/exe once the backing
+    // inode has been unlinked, which happens when a desktop install replaces
+    // the binary while the requesting client is still running. Spawning that
+    // literal path always fails with a confusing exec error, so reject it up
+    // front and tell the user what actually happened.
+    let deleted_suffix = " (deleted)";
+    if executable
+        .as_os_str()
+        .to_string_lossy()
+        .ends_with(deleted_suffix)
+    {
+        return Err(ProcessError::UnsafeRequest(format!(
+            "the requesting client was updated on disk and still runs the old binary ({}); \
+             restart the client so it matches the installed release",
+            executable.display()
+        )));
+    }
     let metadata = fs::metadata(&proc_executable)?;
     if !metadata.is_file()
         || metadata.uid() != expected_uid
@@ -629,6 +646,53 @@ mod tests {
             broker: None,
             stop_requested: false,
         }
+    }
+
+    #[test]
+    fn peer_executable_rejects_replaced_client_binaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let staged = directory.path().join("sleeper");
+        fs::copy("/usr/bin/sleep", &staged).unwrap();
+        // Spawning right after writing the copy can hit ETXTBSY while the
+        // kernel finishes releasing the writer handle (observed as a flake on
+        // btrfs); a short bounded retry keeps the test deterministic.
+        let mut child = {
+            let command = || {
+                Command::new(&staged)
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+            };
+            let mut attempt = 0;
+            loop {
+                match command() {
+                    Ok(child) => break child,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 20 =>
+                    {
+                        attempt += 1;
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(error) => panic!("failed to spawn the staged sleeper: {error}"),
+                }
+            }
+        };
+        // Removing the backing file while the child still runs makes the
+        // kernel report "<path> (deleted)" through /proc/<pid>/exe.
+        fs::remove_file(&staged).unwrap();
+
+        let expected_uid = unsafe { libc::getuid() };
+        let error = peer_executable(child.id() as libc::pid_t, expected_uid)
+            .expect_err("replaced binaries must be rejected");
+
+        let ProcessError::UnsafeRequest(detail) = error else {
+            panic!("expected UnsafeRequest, got {error:?}");
+        };
+        assert!(detail.contains("restart the client"), "{detail}");
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

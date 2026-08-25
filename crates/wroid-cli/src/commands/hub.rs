@@ -1830,12 +1830,17 @@ fn profile_needs_mouse(profile: &ProfileV2) -> bool {
 
 fn open_profile_editor(profile: LibraryProfile) -> Result<String> {
     let executable = env::current_exe().context("failed to locate the wroid executable")?;
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(["profile", "edit-v2"])
         .arg(&profile.path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+    // Keep the standard streams attached: the editor's WebKit console
+    // (window-capture failures, portal errors) is its only diagnostic
+    // surface in release builds, and nulling it made capture issues
+    // impossible to investigate.
+    command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    command
         .spawn()
         .with_context(|| format!("failed to open editor for {}", profile.profile.name))?;
     Ok(format!("Opening controls for {}", profile.profile.name))

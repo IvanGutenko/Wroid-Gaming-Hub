@@ -10,6 +10,7 @@ pub(crate) mod graphics;
 pub(crate) mod hub;
 pub(crate) mod input;
 pub(crate) mod kwin_focus;
+pub(crate) mod kwin_screenshot;
 pub(crate) mod launch_v2;
 pub(crate) mod local_web_app;
 pub(crate) mod play_v2;
