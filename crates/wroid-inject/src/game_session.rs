@@ -18,7 +18,7 @@ use crate::{
     DeviceConfig, InputDeviceNode, InstalledWaydroidBridge, UinputTouchInjector,
     WaydroidBridgeLease, WaydroidPresentation, WROID_TOUCHSCREEN_NAME,
 };
-use wroid_core::profile_v2::{InputV2, JoystickMode, ProfileV2};
+use wroid_core::profile_v2::{InputV2, JoystickMode, JoystickWalkMode, ProfileV2};
 use wroid_core::{Point, Resolution};
 use wroid_input::mouse::{
     EvdevMouse, MouseButton, MouseButtonTransition, MouseEvent, RelativeMouseMotion,
@@ -1836,6 +1836,8 @@ struct UnifiedRuntime<I: TouchInjector> {
     last_walk_scales: Vec<f64>,
     /// Sustained taps ("tap or hold"): Some while the key is physically held.
     sustained_taps: Vec<Option<ContactId>>,
+    /// Toggle-mode walk state per joystick binding (slow_mode: toggle).
+    walk_toggled: Vec<bool>,
     pending_radials: Vec<PendingRadial>,
     active_layers: u64,
     held_keys: ModifierMask,
@@ -1934,6 +1936,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             last_joystick_frame: vec![None; control_count],
             last_walk_scales: vec![1.0; control_count],
             sustained_taps: vec![None; control_count],
+            walk_toggled: vec![false; control_count],
             pending_radials: Vec::new(),
             active_layers: 0,
             held_keys: ModifierMask::EMPTY,
@@ -2031,6 +2034,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         self.last_joystick_frame = vec![None; control_count];
         self.last_walk_scales = vec![1.0; control_count];
         self.sustained_taps = vec![None; control_count];
+        self.walk_toggled = vec![false; control_count];
         Ok(())
     }
 
@@ -2192,6 +2196,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         } else {
             self.held_keys.remove(key);
         }
+        self.update_walk_toggles(key, pressed);
 
         let activation_consumed = if let Some(layer) = self.layer_controls[key.index() as usize] {
             match (layer.mode, pressed) {
@@ -2812,14 +2817,51 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         let RuntimeControlAction::VirtualJoystick {
             slow_key,
             walk_scale,
+            walk_mode,
             ..
         } = &self.plan.controls[index].action
         else {
             return 1.0;
         };
-        match slow_key {
-            Some(key) if self.held_keys.contains(*key) => *walk_scale,
-            _ => 1.0,
+        let slow_active = match (slow_key, walk_mode) {
+            (Some(key), JoystickWalkMode::Hold) => self.held_keys.contains(*key),
+            (Some(_), JoystickWalkMode::Toggle) => self.walk_toggled[index],
+            _ => false,
+        };
+        if slow_active {
+            *walk_scale
+        } else {
+            1.0
+        }
+    }
+
+    /// Flip toggle-walk for every joystick whose slow key was just pressed.
+    fn update_walk_toggles(&mut self, key: HostKeyName, pressed: bool) {
+        if !pressed {
+            return;
+        }
+        for index in 0..self.plan.controls.len() {
+            if let RuntimeControlAction::VirtualJoystick {
+                slow_key: Some(slow_key),
+                walk_mode: JoystickWalkMode::Toggle,
+                ..
+            } = &self.plan.controls[index].action
+            {
+                if *slow_key == key {
+                    self.walk_toggled[index] = !self.walk_toggled[index];
+                    if self.trace_input {
+                        println!(
+                            "[trace] runtime walk toggle {}={}",
+                            self.plan.controls[index].name,
+                            if self.walk_toggled[index] {
+                                "on"
+                            } else {
+                                "off"
+                            }
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3015,6 +3057,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         self.last_joystick_frame.fill(None);
         self.last_walk_scales.fill(1.0);
         self.sustained_taps.fill(None);
+        self.walk_toggled.fill(false);
         self.pending_radials.clear();
         if self.trace_input {
             println!(
@@ -3841,8 +3884,8 @@ mod tests {
         serve_bridge_broker, BridgeBrokerClient, BridgeHelperFactory, BridgeHelperSession,
     };
     use wroid_core::profile_v2::{
-        ActionV2, BindingV2, JoystickMode, LayerActivation, LayerV2, NormalizedPoint,
-        NormalizedRect, ProfileV2,
+        ActionV2, BindingV2, JoystickMode, JoystickWalkMode, LayerActivation, LayerV2,
+        NormalizedPoint, NormalizedRect, ProfileV2,
     };
     use wroid_runtime::{TouchInjectionError, TouchInjector};
 
@@ -5437,6 +5480,7 @@ mod tests {
                 reaffirm_ms: Some(50),
                 slow_key: None,
                 slow_scale: None,
+                slow_mode: JoystickWalkMode::default(),
             },
         }
     }
@@ -5780,6 +5824,7 @@ mod tests {
                     reaffirm_ms: Some(50),
                     slow_key: Some("shift".to_owned()),
                     slow_scale: Some(0.5),
+                    slow_mode: JoystickWalkMode::Hold,
                 },
             }],
         );
@@ -6113,6 +6158,83 @@ mod tests {
             emitted_phases(&runtime),
             vec![TouchPhase::Down, TouchPhase::Up]
         );
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn walk_toggle_mode_persists_after_key_release() {
+        let mut runtime = test_runtime(
+            vec![],
+            vec![BindingV2 {
+                name: "movement".to_owned(),
+                layer: None,
+                modifier: None,
+                input: InputV2::KeyCluster {
+                    up: "w".to_owned(),
+                    left: "a".to_owned(),
+                    down: "s".to_owned(),
+                    right: "d".to_owned(),
+                },
+                action: ActionV2::VirtualJoystick {
+                    center: NormalizedPoint { x: 0.5, y: 0.8 },
+                    radius: 0.1,
+                    dead_zone: 0.0,
+                    mode: JoystickMode::Hold,
+                    reaffirm_ms: Some(50),
+                    slow_key: Some("shift".to_owned()),
+                    slow_scale: Some(0.5),
+                    slow_mode: JoystickWalkMode::Toggle,
+                },
+            }],
+        );
+
+        // Full deflection baseline.
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::W,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        let full = runtime.engine.injector().frames.last().unwrap().events()[0]
+            .position
+            .y;
+
+        // Tap shift ON: walk engages even though shift is released.
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::LeftShift,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::LeftShift,
+                KeyTransition::Released,
+            ))
+            .unwrap();
+        let walked = runtime.engine.injector().frames.last().unwrap().events()[0]
+            .position
+            .y;
+        let center_y = 800_i64;
+        assert!((center_y - i64::from(walked)) * 2 - (center_y - i64::from(full)) <= 2);
+
+        // Tap shift OFF: back to full speed.
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::LeftShift,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::LeftShift,
+                KeyTransition::Released,
+            ))
+            .unwrap();
+        let restored = runtime.engine.injector().frames.last().unwrap().events()[0]
+            .position
+            .y;
+        assert_eq!(restored, full);
         runtime.stop().unwrap();
     }
 }

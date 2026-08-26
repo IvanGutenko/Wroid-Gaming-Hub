@@ -290,6 +290,10 @@ pub enum ActionV2 {
         slow_key: Option<String>,
         #[serde(default)]
         slow_scale: Option<f64>,
+        /// How `slow_key` behaves: held down (Standoff 2) or tapped to
+        /// toggle walk on/off until the next tap (PUBG-style).
+        #[serde(default)]
+        slow_mode: JoystickWalkMode,
     },
     MouseAim {
         region: NormalizedRect,
@@ -332,6 +336,16 @@ pub enum RadialDirection {
 
 fn default_radial_distance() -> f64 {
     0.07
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoystickWalkMode {
+    /// Slow while the key is physically held.
+    #[default]
+    Hold,
+    /// Each key press toggles slow walk on/off.
+    Toggle,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1327,6 +1341,7 @@ mod tests {
             reaffirm_ms: Some(50),
             slow_key: None,
             slow_scale: None,
+            slow_mode: Default::default(),
         };
 
         let error = profile.validate().unwrap_err();

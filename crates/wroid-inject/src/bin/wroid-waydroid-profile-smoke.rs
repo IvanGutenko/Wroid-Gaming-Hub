@@ -389,6 +389,7 @@ mod tests {
                 reaffirm_ms: None,
                 slow_key: None,
                 slow_scale: None,
+                slow_mode: Default::default(),
             },
         }
     }

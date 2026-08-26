@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 use wroid_core::profile_v2::{
-    materialize_axis, ActionV2, BindingV2, InputV2, JoystickMode, LayerActivation, ProfileV2,
-    ProfileV2ValidationError,
+    materialize_axis, ActionV2, BindingV2, InputV2, JoystickMode, JoystickWalkMode,
+    LayerActivation, ProfileV2, ProfileV2ValidationError,
 };
 use wroid_core::{Point, Resolution};
 
@@ -408,6 +408,7 @@ pub enum RuntimeControlAction {
         reaffirm_interval: Option<Duration>,
         slow_key: Option<HostKeyName>,
         walk_scale: f64,
+        walk_mode: JoystickWalkMode,
     },
     MouseAim {
         aim: MouseAim,
@@ -538,6 +539,7 @@ fn materialize_action(
             reaffirm_ms,
             slow_key,
             slow_scale,
+            slow_mode,
         } => {
             let contact_id = allocate_contact_id(next_contact_id);
             let joystick = VirtualJoystick::from_profile_v2_geometry(
@@ -560,6 +562,7 @@ fn materialize_action(
                 reaffirm_interval: reaffirm_ms.map(Duration::from_millis),
                 slow_key,
                 walk_scale,
+                walk_mode: *slow_mode,
             })
         }
         ActionV2::MouseAim {
@@ -723,6 +726,7 @@ mod tests {
                         reaffirm_ms: Some(50),
                         slow_key: Some("shift".to_owned()),
                         slow_scale: Some(0.5),
+                        slow_mode: JoystickWalkMode::Hold,
                     },
                 },
                 BindingV2 {

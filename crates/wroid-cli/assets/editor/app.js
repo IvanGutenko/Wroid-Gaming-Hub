@@ -874,6 +874,7 @@
           <div>${keyCaptureField("stickSlowKey", "Slow walk key", action.slow_key ?? "", "Backspace clears it.")}</div>
           <div>${numberField("stickSlowScale", "Walk speed (0-1)", action.slow_scale ?? 0.5, 0.05, 1, 0.05)}</div>
         </div>
+        ${selectField("stickSlowMode", "Walk trigger", action.slow_mode || "hold", [["hold", "While held"], ["toggle", "Tap to toggle"]])}
         <p class="hint">The radius is relative to the shorter surface edge. Drag the ring handle to resize.</p>`;
     }
     return `<div class="inspector-row">
@@ -1066,6 +1067,12 @@
         if (scale < 1) action.slow_scale = scale;
         else delete action.slow_scale;
       }, number);
+      wireChange("stickSlowMode", (value) => {
+        if (action.slow_key) {
+          if (value === "toggle") action.slow_mode = "toggle";
+          else delete action.slow_mode;
+        }
+      });
     } else if (action.kind === "mouse_aim") {
       wireChange("aimX", (value) => {
         action.region.x = rounded(clamp(value, 0, 1 - action.region.w));

@@ -361,6 +361,7 @@ mod tests {
                         reaffirm_ms: Some(50),
                         slow_key: None,
                         slow_scale: None,
+                        slow_mode: Default::default(),
                     },
                 },
                 BindingV2 {
