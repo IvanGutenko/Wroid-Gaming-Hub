@@ -140,20 +140,25 @@ fn run_relay(
         return Err(error).context("failed to start the KWin focus protection script");
     }
 
+    let claimed_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let claimed_in_callback = claimed_flag.clone();
     let (focus_tx, focus_rx) = mpsc::channel();
     let _receiver = callback_connection.start_receive(
         MatchRule::new_method_call(),
         Box::new(move |message, _connection| {
-            if message
-                .member()
-                .is_some_and(|member| member == "focusChanged")
-            {
-                if let Ok((value, output)) = message.read2::<String, String>() {
-                    let _ = focus_tx.send((
-                        focus_event_is_owned(&value, owner_pid, Path::new("/proc")),
-                        output,
-                    ));
+            match message.member() {
+                Some(member) if member == "focusChanged" => {
+                    if let Ok((value, output)) = message.read2::<String, String>() {
+                        let _ = focus_tx.send((
+                            focus_event_is_owned(&value, owner_pid, Path::new("/proc")),
+                            output,
+                        ));
+                    }
                 }
+                Some(member) if member == "claimResult" => {
+                    claimed_in_callback.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
             }
             true
         }),
@@ -182,7 +187,9 @@ fn run_relay(
                 last_output = Some(output);
                 write_focus(&mut client, focused, last_output.as_deref());
             }
-            if last_focus != Some(true)
+            let claim_done =
+                claimed_flag.load(std::sync::atomic::Ordering::Relaxed) || last_focus == Some(true);
+            if !claim_done
                 && std::time::Instant::now() >= next_claim
                 && std::time::Instant::now() < claim_deadline
             {
@@ -192,6 +199,7 @@ fn run_relay(
                     &claim_path,
                     owner_pid,
                     &format!("{plugin_name}_claim"),
+                    &callback_address,
                 );
             }
         }
@@ -300,11 +308,19 @@ function fullscreenGameWindow(window) {{
     if (!isGameSurface(window)) {{
         return;
     }}
-    if (window.fullScreen) {{
+    if (window.fullScreen || window.frameGeometry.width < 100) {{
         return;
     }}
     workspace.activeWindow = window;
-    workspace.slotWindowFullScreen();
+    // slotWindowFullScreen toggles WHATEVER is active; if the activation did
+    // not land yet, skipping beats accidentally fullscreening the user's
+    // browser.
+    if (workspace.activeWindow !== window) {{
+        return;
+    }}
+    if (!window.fullScreen) {{
+        workspace.slotWindowFullScreen();
+    }}
 }}
 
 function claimExisting() {{
@@ -337,6 +353,7 @@ fn run_fullscreen_claim(
     claim_path: &Path,
     owner_pid: u32,
     plugin_name: &str,
+    callback_address: &str,
 ) -> Result<()> {
     let script = format!(
         r#"
@@ -346,8 +363,17 @@ for (const candidate of workspace.windowList()) {{
     if ((!windowClass.startsWith("waydroid") && !owned) || candidate.fullScreen) {{
         continue;
     }}
+    if (candidate.frameGeometry.width < 100) {{
+        continue;
+    }}
     workspace.activeWindow = candidate;
-    workspace.slotWindowFullScreen();
+    if (workspace.activeWindow !== candidate) {{
+        continue;
+    }}
+    if (!candidate.fullScreen) {{
+        workspace.slotWindowFullScreen();
+    }}
+    callDBus("{callback_address}", "/", "", "claimResult");
 }}
 "#
     );
