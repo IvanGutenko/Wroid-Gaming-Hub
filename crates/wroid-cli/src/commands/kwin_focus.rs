@@ -104,7 +104,7 @@ fn run_relay(
     let callback_connection =
         SyncConnection::new_session().context("failed to connect to the desktop D-Bus")?;
     let callback_address = callback_connection.unique_name().to_string();
-    let script = focus_script(&callback_address);
+    let script = focus_script(&callback_address, owner_pid);
     fs::write(script_path, script)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
     fs::set_permissions(script_path, fs::Permissions::from_mode(0o600))
@@ -226,9 +226,10 @@ fn focus_line(focused: bool, output: Option<&str>) -> Vec<u8> {
     line
 }
 
-fn focus_script(callback_address: &str) -> String {
+fn focus_script(callback_address: &str, owner_pid: u32) -> String {
     format!(
         r#"
+const OWNER_PID = {owner_pid};
 function surfaceIdentity(window) {{
     if (window == null) {{
         return "other";
@@ -256,16 +257,37 @@ function outputName(window) {{
 // The direct Waydroid window opens maximized, which keeps the Plasma panel
 // visible; a real fullscreen hides it. `fullScreen` is read-only in the
 // scripting engine, but slotWindowFullScreen toggles the active window.
-function fullscreenGameWindow(window) {{
+function isGameSurface(window) {{
     if (window == null) {{
-        return;
+        return false;
     }}
     const windowClass = String(window.resourceClass || "").toLowerCase();
-    if (!windowClass.startsWith("waydroid") || window.fullScreen) {{
+    if (windowClass.startsWith("waydroid")) {{
+        return true;
+    }}
+    // The direct-presentation render surface is owned by the session worker
+    // itself (class "wroid", empty caption) — match it by process id so the
+    // hub window (also class "wroid") is never captured.
+    return Number(window.pid || 0) === OWNER_PID;
+}}
+
+function fullscreenGameWindow(window) {{
+    if (!isGameSurface(window)) {{
+        return;
+    }}
+    if (window.fullScreen) {{
         return;
     }}
     workspace.activeWindow = window;
     workspace.slotWindowFullScreen();
+}}
+
+function claimExisting() {{
+    for (const candidate of workspace.windowList()) {{
+        if (isGameSurface(candidate)) {{
+            fullscreenGameWindow(candidate);
+        }}
+    }}
 }}
 
 function reportFocus(window) {{
@@ -274,6 +296,10 @@ function reportFocus(window) {{
 }}
 
 workspace.windowActivated.connect(reportFocus);
+// The render surface may appear only after Android finishes booting; grab,
+// raise, and fullscreen it the moment it is created.
+workspace.windowAdded.connect(fullscreenGameWindow);
+claimExisting();
 reportFocus(workspace.activeWindow);
 "#
     )
@@ -350,7 +376,7 @@ mod tests {
 
     #[test]
     fn script_matches_waydroid_and_reports_process_identity() {
-        let script = focus_script(":1.42");
+        let script = focus_script(":1.42", 4242);
         assert!(script.contains("window.resourceClass"));
         assert!(script.contains("window.resourceName"));
         assert!(script.contains("startsWith(\"waydroid.\")"));
@@ -359,10 +385,16 @@ mod tests {
         assert!(script.contains("workspace.windowActivated.connect(reportFocus)"));
         assert!(script.contains("reportFocus(workspace.activeWindow)"));
         assert!(script.contains("callDBus(\":1.42\""));
-        // Fullscreen-on-focus: only the Waydroid window, only when not
-        // already fullscreen, toggled through the active-window slot.
+        // Fullscreen-on-focus: the Waydroid window or the worker's own render
+        // surface, only when not already fullscreen, toggled through the
+        // active-window slot. New surfaces are claimed on creation and
+        // existing ones at script start so a window that appeared during
+        // Android boot is raised instead of hiding behind other windows.
         assert!(script.contains("function fullscreenGameWindow(window)"));
-        assert!(script.contains("!windowClass.startsWith(\"waydroid\") || window.fullScreen"));
+        assert!(script.contains("function isGameSurface(window)"));
+        assert!(script.contains("Number(window.pid || 0) === OWNER_PID"));
+        assert!(script.contains("workspace.windowAdded.connect(fullscreenGameWindow)"));
+        assert!(script.contains("claimExisting();"));
         assert!(script.contains("workspace.slotWindowFullScreen()"));
     }
 
