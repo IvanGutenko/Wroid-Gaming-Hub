@@ -14,6 +14,11 @@ use dbus::message::MatchRule;
 
 const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOP_INTERVAL: Duration = Duration::from_millis(20);
+/// How long the relay keeps trying to fullscreen the game surface after
+/// session start (Android boot takes tens of seconds).
+const FULLSCREEN_CLAIM_WINDOW: Duration = Duration::from_secs(240);
+/// Pause between claim attempts while the surface has not focused yet.
+const FULLSCREEN_CLAIM_RETRY: Duration = Duration::from_millis(1000);
 
 pub(crate) struct KwinFocusRelay {
     socket_path: PathBuf,
@@ -158,6 +163,14 @@ fn run_relay(
     let mut client: Option<UnixStream> = None;
     let mut last_focus = None;
     let mut last_output: Option<String> = None;
+    // Boot-time fullscreen claim: the render surface appears tens of seconds
+    // into Android boot, and the creation-time hook races window placement,
+    // which used to leave the game maximized behind the Plasma panel. Until
+    // the surface reports focus once, re-run a one-shot claim script every
+    // second.
+    let claim_path = script_path.with_file_name("claim.js");
+    let claim_deadline = std::time::Instant::now() + FULLSCREEN_CLAIM_WINDOW;
+    let mut next_claim = std::time::Instant::now();
     let relay_result = (|| -> Result<()> {
         while stop.try_recv().is_err() {
             callback_connection
@@ -168,6 +181,18 @@ fn run_relay(
                 last_focus = Some(focused);
                 last_output = Some(output);
                 write_focus(&mut client, focused, last_output.as_deref());
+            }
+            if last_focus != Some(true)
+                && std::time::Instant::now() >= next_claim
+                && std::time::Instant::now() < claim_deadline
+            {
+                next_claim = std::time::Instant::now() + FULLSCREEN_CLAIM_RETRY;
+                let _ = run_fullscreen_claim(
+                    &kwin_connection,
+                    &claim_path,
+                    owner_pid,
+                    &format!("{plugin_name}_claim"),
+                );
             }
         }
         Ok(())
@@ -303,6 +328,56 @@ claimExisting();
 reportFocus(workspace.activeWindow);
 "#
     )
+}
+
+/// One fullscreen-claim pass: activate and fullscreen the game surface if it
+/// exists and is not already fullscreen.
+fn run_fullscreen_claim(
+    kwin_connection: &Connection,
+    claim_path: &Path,
+    owner_pid: u32,
+    plugin_name: &str,
+) -> Result<()> {
+    let script = format!(
+        r#"
+for (const candidate of workspace.windowList()) {{
+    const windowClass = String(candidate.resourceClass || "").toLowerCase();
+    const owned = Number(candidate.pid || 0) === {owner_pid};
+    if ((!windowClass.startsWith("waydroid") && !owned) || candidate.fullScreen) {{
+        continue;
+    }}
+    workspace.activeWindow = candidate;
+    workspace.slotWindowFullScreen();
+}}
+"#
+    );
+    fs::write(claim_path, script)
+        .with_context(|| format!("failed to write {}", claim_path.display()))?;
+    fs::set_permissions(claim_path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure {}", claim_path.display()))?;
+
+    let proxy = kwin_connection.with_proxy("org.kde.KWin", "/Scripting", DBUS_TIMEOUT);
+    let _: Result<(bool,), _> =
+        proxy.method_call("org.kde.kwin.Scripting", "unloadScript", (plugin_name,));
+    let (script_id,): (i32,) = proxy
+        .method_call(
+            "org.kde.kwin.Scripting",
+            "loadScript",
+            (claim_path.to_string_lossy().as_ref(), plugin_name),
+        )
+        .context("KWin rejected the fullscreen claim script")?;
+    if script_id < 0 {
+        bail!("KWin could not load the fullscreen claim script");
+    }
+    let script_proxy = kwin_connection.with_proxy(
+        "org.kde.KWin",
+        format!("/Scripting/Script{script_id}"),
+        DBUS_TIMEOUT,
+    );
+    let _ = script_proxy.method_call::<(), _, _, _>("org.kde.kwin.Script", "run", ());
+    let _: Result<(bool,), _> =
+        proxy.method_call("org.kde.kwin.Scripting", "unloadScript", (plugin_name,));
+    Ok(())
 }
 
 fn focus_event_is_owned(value: &str, owner_pid: u32, proc_root: &Path) -> bool {
