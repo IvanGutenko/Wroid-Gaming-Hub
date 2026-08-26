@@ -1836,7 +1836,7 @@ fn open_profile_editor(profile: LibraryProfile) -> Result<String> {
     let executable = env::current_exe().context("failed to locate the wroid executable")?;
     let mut command = Command::new(executable);
     command
-        .args(["profile", "edit-v2", "--browser"])
+        .args(["profile", "edit-v2"])
         .arg(&profile.path)
         .stdin(Stdio::null());
     // Keep the standard streams attached: the editor's WebKit console

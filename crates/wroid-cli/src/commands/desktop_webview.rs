@@ -192,6 +192,18 @@ fn configure_webview(webview: &WebView, origin: &LocalOrigin) {
     }
     webview.connect_create(|_, _| None);
     webview.connect_context_menu(|_, _, _, _| true);
+    // WebKitGTK turns the mouse's back/forward buttons (GDK 8/9) into
+    // history navigation before the page can see them, which broke binding
+    // actions by pressing side buttons in the controls editor. Swallow them
+    // at the GTK layer so the page never loses focus or state to navigation;
+    // bindings pick mouse buttons through the editor's picker chips.
+    webview.connect_button_press_event(|_, event| {
+        if event.button() == 8 || event.button() == 9 {
+            Propagation::Stop
+        } else {
+            Propagation::Proceed
+        }
+    });
     webview.connect_permission_request(|_, request| {
         let user_media = request
             .clone()
