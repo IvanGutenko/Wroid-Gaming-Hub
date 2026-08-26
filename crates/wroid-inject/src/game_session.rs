@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,60 @@ use wroid_runtime::{
 const DEFAULT_WIDTH: u32 = 1920;
 const DEFAULT_HEIGHT: u32 = 1080;
 const IDLE_POLL: Duration = Duration::from_millis(50);
+/// How often the event loop checks the profile file for editor saves.
+const PROFILE_RELOAD_POLL: Duration = Duration::from_millis(1000);
+
+/// Attempts a live control-plan reload when the profile file changed.
+///
+/// A failed load or validation is logged and skipped; the running controls
+/// stay in effect until the next successful save. `last_modified` is updated
+/// either way so one save triggers exactly one attempt.
+fn reload_profile_if_changed<I: TouchInjector>(
+    runtime: &mut UnifiedRuntime<I>,
+    spec: &mut ProfileReloadSpec,
+) -> bool {
+    let Ok(metadata) = fs::metadata(&spec.path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    if modified <= spec.last_modified {
+        return false;
+    }
+    let outcome = (|| -> Result<RuntimeControlPlan, Box<dyn Error + Send + Sync>> {
+        let profile = ProfileV2::load_from_path(&spec.path)?;
+        profile
+            .validate()
+            .map_err(|error| io::Error::other(error.errors.join("; ")))?;
+        Ok(RuntimeControlPlan::from_profile_v2(
+            &profile,
+            spec.resolution,
+        )?)
+    })();
+    let mut swapped = false;
+    match outcome {
+        Ok(plan) => {
+            let bindings = plan.controls.len();
+            match runtime.replace_plan(plan) {
+                Ok(()) => {
+                    println!("[reload] controls updated live: {bindings} bindings");
+                    swapped = true;
+                }
+                Err(error) => eprintln!("[reload] swap failed: {error}"),
+            }
+        }
+        Err(error) => eprintln!("[reload] rejected profile changes: {error}"),
+    }
+    // Consume the change either way so one save triggers exactly one attempt.
+    if let Ok(fresh) = fs::metadata(&spec.path) {
+        if let Ok(mtime) = fresh.modified() {
+            spec.last_modified = mtime;
+        }
+    }
+    swapped
+}
+
 const INPUT_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const FOCUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Grace period for a connected focus relay to report its first window event.
@@ -155,6 +210,10 @@ pub fn run_game_session(mut options: GameSessionOptions) -> GameSessionResult<Ga
         .map(EvdevMouse::open)
         .transpose()?;
     let config = DeviceConfig::new(options.width, options.height)?;
+    let session_resolution = Resolution {
+        width: config.width(),
+        height: config.height(),
+    };
     let mut injector = UinputTouchInjector::open(config)?;
     let event_node = injector
         .sink_mut()
@@ -407,6 +466,13 @@ pub fn run_game_session(mut options: GameSessionOptions) -> GameSessionResult<Ga
                 grab_allowed: options.grab,
                 initial_mode,
                 overlay: cursor_overlay.as_ref(),
+                profile_reload: Some(ProfileReloadSpec {
+                    path: profile_path.to_path_buf(),
+                    resolution: session_resolution,
+                    last_modified: fs::metadata(profile_path)
+                        .and_then(|meta| meta.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                }),
             },
         );
         if let Some(mut trace) = android_input_trace {
@@ -1096,6 +1162,16 @@ struct EventLoopOptions<'a> {
     /// Optional UI cursor renderer. Startup chooses whether UI mode is
     /// supported; losing this renderer later must not change input routing.
     overlay: Option<&'a crate::cursor_overlay::CursorOverlay>,
+    /// Live profile reload: watch the profile file and hot-swap the control
+    /// plan when the editor saves changes.
+    profile_reload: Option<ProfileReloadSpec>,
+}
+
+/// Everything the event loop needs to hot-reload the control plan.
+struct ProfileReloadSpec {
+    path: PathBuf,
+    resolution: Resolution,
+    last_modified: SystemTime,
 }
 
 /// Input ownership mode: who currently owns the physical mouse.
@@ -1258,7 +1334,7 @@ fn run_event_loop<I: TouchInjector>(
     receiver: &Receiver<HostEvent>,
     input_readers: &InputReaderControls,
     runtime: &mut UnifiedRuntime<I>,
-    options: EventLoopOptions<'_>,
+    mut options: EventLoopOptions<'_>,
 ) -> GameSessionResult<EventLoopExit> {
     let trace_input = options.trace_input;
     let exit_after = options.exit_after;
@@ -1284,6 +1360,7 @@ fn run_event_loop<I: TouchInjector>(
     // must not fight that choice until the user overrides it again.
     let mut mode_manually_overridden = false;
     let loop_started_at = Instant::now();
+    let mut next_profile_check = Duration::ZERO;
     let mut control_pressed = false;
     let (surface_width, surface_height) = runtime.resolution();
     let mut virtual_cursor = VirtualCursor::centered(surface_width, surface_height);
@@ -1676,6 +1753,25 @@ fn run_event_loop<I: TouchInjector>(
             let _phase = LoopPhaseTimer::with_budget("runtime tick", Duration::from_millis(20));
             runtime.tick()?;
         }
+        if let Some(spec) = options.profile_reload.as_mut() {
+            if loop_started_at.elapsed() >= next_profile_check {
+                next_profile_check = loop_started_at.elapsed() + PROFILE_RELOAD_POLL;
+                let plan_swapped = reload_profile_if_changed(runtime, spec);
+                if plan_swapped && input_active {
+                    // Rebind the current mode to the fresh plan: always-on
+                    // aims reactivate, UI cursor stays put.
+                    apply_input_mode(
+                        runtime,
+                        input_readers,
+                        &mut overlay,
+                        mode,
+                        grab_allowed,
+                        false,
+                        &virtual_cursor,
+                    )?;
+                }
+            }
+        }
         if exit_after.is_some_and(|limit| loop_started_at.elapsed() >= limit) {
             return Ok(EventLoopExit::TimeLimitReached);
         }
@@ -1846,6 +1942,92 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             rejected_kernel_timestamps: 0,
             trace_input,
         })
+    }
+
+    /// Swaps in a freshly compiled control plan (live profile reload).
+    ///
+    /// Every contact is cancelled and all per-control state is rebuilt, so
+    /// bindings added or moved in the editor apply without restarting the
+    /// game. Physical keys held during the swap are forgotten; the next key
+    /// event re-establishes them.
+    fn replace_plan(&mut self, plan: RuntimeControlPlan) -> GameSessionResult<()> {
+        self.suspend()?;
+
+        let mut next_contact = plan
+            .controls
+            .iter()
+            .filter_map(|control| match &control.action {
+                RuntimeControlAction::VirtualJoystick { joystick, .. } => {
+                    Some(joystick.contact_id().get())
+                }
+                RuntimeControlAction::MouseAim { aim, settings } => Some(
+                    aim.contact_id()
+                        .get()
+                        .max(settings.alternate_contact_id.get()),
+                ),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let control_count = plan.controls.len();
+        let mut control_inputs = Vec::with_capacity(control_count);
+        let mut point_contacts = Vec::with_capacity(control_count);
+        let mut aim_controllers = Vec::with_capacity(control_count);
+        let mut aim_toggle_keys = Vec::with_capacity(control_count);
+        for control in &plan.controls {
+            control_inputs.push(
+                ResolvedControlInput::from_profile(&control.input).ok_or_else(|| {
+                    io::Error::other("validated control input did not resolve at runtime")
+                })?,
+            );
+            if matches!(
+                control.action,
+                RuntimeControlAction::Tap { .. }
+                    | RuntimeControlAction::Hold { .. }
+                    | RuntimeControlAction::RadialSelect { .. }
+            ) {
+                point_contacts.push(Some(ContactId::new(next_contact)));
+                next_contact = next_contact.saturating_add(1);
+            } else {
+                point_contacts.push(None);
+            }
+            if let RuntimeControlAction::MouseAim { aim, settings } = &control.action {
+                aim_controllers.push(Some(MouseAimController::new(
+                    aim.clone(),
+                    settings.clone(),
+                )?));
+                aim_toggle_keys.push(settings.toggle_key.as_deref().and_then(HostKeyName::parse));
+            } else {
+                aim_controllers.push(None);
+                aim_toggle_keys.push(None);
+            }
+        }
+
+        let mut layer_controls = [None; 57];
+        for layer in &plan.layers {
+            let mask = layer_mask_bit(layer.id)
+                .ok_or_else(|| io::Error::other("declared runtime layer id is out of range"))?;
+            layer_controls[usize::from(layer.activation_key.index())] = Some(LayerControl {
+                mask,
+                mode: layer.mode,
+            });
+        }
+
+        self.plan = plan;
+        self.control_inputs = control_inputs;
+        self.layer_controls = layer_controls;
+        self.directions = vec![DirectionalInput::default(); control_count];
+        self.desired_directions = vec![DirectionalInput::default(); control_count];
+        self.active_bindings = vec![false; control_count];
+        self.desired_bindings = vec![false; control_count];
+        self.point_contacts = point_contacts;
+        self.cursor_contact = ContactId::new(next_contact);
+        self.aim_controllers = aim_controllers;
+        self.aim_toggle_keys = aim_toggle_keys;
+        self.last_joystick_frame = vec![None; control_count];
+        self.last_walk_scales = vec![1.0; control_count];
+        Ok(())
     }
 
     fn start(&mut self) -> GameSessionResult<()> {
@@ -4000,6 +4182,7 @@ mod tests {
                 // This models a renderer failure after UI mode was selected.
                 // Input routing must remain usable without the cursor sprite.
                 overlay: None,
+                profile_reload: None,
             },
         )
         .unwrap();
@@ -4079,6 +4262,7 @@ mod tests {
                 grab_allowed: true,
                 initial_mode: InputMode::Aim,
                 overlay: None,
+                profile_reload: None,
             },
         )
         .unwrap();
@@ -4166,6 +4350,7 @@ mod tests {
                 grab_allowed: true,
                 initial_mode: InputMode::Aim,
                 overlay: None,
+                profile_reload: None,
             },
         )
         .unwrap();
@@ -4243,6 +4428,7 @@ mod tests {
                 grab_allowed: true,
                 initial_mode: InputMode::Aim,
                 overlay: None,
+                profile_reload: None,
             },
         )
         .unwrap();
@@ -5644,6 +5830,79 @@ mod tests {
                 "key {key:?} produced submitted={submitted} frames={frames}"
             );
         }
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn replace_plan_hot_swaps_bindings_without_restart() {
+        let mut runtime = test_runtime(
+            vec![],
+            vec![point_binding(
+                "reload",
+                InputV2::Key {
+                    key: "r".to_owned(),
+                },
+                None,
+                None,
+                0.9,
+                true,
+            )],
+        );
+
+        // Old plan works.
+        assert!(send_key(
+            &mut runtime,
+            wroid_input::HostKey::R,
+            KeyTransition::Pressed
+        ));
+        let old_frames = runtime.engine.injector().frames.len();
+        assert!(old_frames >= 2);
+
+        // New plan drops "r", adds "g" at a different point.
+        let new_plan = RuntimeControlPlan::from_profile_v2(
+            &ProfileV2 {
+                schema_version: 2,
+                name: "hot reload".to_owned(),
+                package_name: "com.example.hot".to_owned(),
+                orientation: Default::default(),
+                layers: Vec::new(),
+                bindings: vec![BindingV2 {
+                    name: "grenade".to_owned(),
+                    layer: None,
+                    modifier: None,
+                    input: InputV2::Key {
+                        key: "g".to_owned(),
+                    },
+                    action: ActionV2::Tap {
+                        point: NormalizedPoint { x: 0.1, y: 0.1 },
+                    },
+                }],
+            },
+            Resolution {
+                width: 1000,
+                height: 1000,
+            },
+        )
+        .unwrap();
+        runtime.replace_plan(new_plan).unwrap();
+
+        // The dropped key no longer dispatches...
+        runtime.engine.injector_mut().frames.clear();
+        assert!(!send_key(
+            &mut runtime,
+            wroid_input::HostKey::R,
+            KeyTransition::Pressed
+        ));
+        assert!(runtime.engine.injector().frames.is_empty());
+
+        // ...and the added key fires immediately after the swap.
+        assert!(send_key(
+            &mut runtime,
+            wroid_input::HostKey::G,
+            KeyTransition::Pressed
+        ));
+        let phases = emitted_phases(&runtime);
+        assert_eq!(phases, vec![TouchPhase::Down, TouchPhase::Up]);
         runtime.stop().unwrap();
     }
 }
