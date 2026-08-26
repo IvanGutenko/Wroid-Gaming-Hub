@@ -1834,6 +1834,8 @@ struct UnifiedRuntime<I: TouchInjector> {
     aim_toggle_keys: Vec<Option<HostKeyName>>,
     last_joystick_frame: Vec<Option<Duration>>,
     last_walk_scales: Vec<f64>,
+    /// Sustained taps ("tap or hold"): Some while the key is physically held.
+    sustained_taps: Vec<Option<ContactId>>,
     pending_radials: Vec<PendingRadial>,
     active_layers: u64,
     held_keys: ModifierMask,
@@ -1931,6 +1933,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             aim_toggle_keys,
             last_joystick_frame: vec![None; control_count],
             last_walk_scales: vec![1.0; control_count],
+            sustained_taps: vec![None; control_count],
             pending_radials: Vec::new(),
             active_layers: 0,
             held_keys: ModifierMask::EMPTY,
@@ -2027,6 +2030,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         self.aim_toggle_keys = aim_toggle_keys;
         self.last_joystick_frame = vec![None; control_count];
         self.last_walk_scales = vec![1.0; control_count];
+        self.sustained_taps = vec![None; control_count];
         Ok(())
     }
 
@@ -2211,6 +2215,9 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
 
         let now = self.now();
         let mut submitted = self.reconcile_continuous(now)?;
+        if !pressed {
+            submitted |= self.release_sustained_taps(RuntimePhysicalInput::Key(key))?;
+        }
         if activation_consumed {
             return Ok(submitted);
         }
@@ -2274,6 +2281,9 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                 submitted |= self.reconcile_continuous(now)?;
                 if pressed {
                     submitted |= self.dispatch_mouse_press(button)?;
+                } else {
+                    submitted |=
+                        self.release_sustained_taps(RuntimePhysicalInput::MouseButton(button))?;
                 }
             }
             MouseEvent::Motion(_) | MouseEvent::Wheel(_) => {}
@@ -2560,23 +2570,46 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         for index in 0..self.plan.controls.len() {
             let control = &self.plan.controls[index];
             match (self.control_inputs[index], &control.action) {
-                (ResolvedControlInput::Key(binding_key), RuntimeControlAction::Tap { point })
-                    if binding_key == key
-                        && binding_available(
-                            control,
-                            physical,
-                            self.active_layers,
-                            self.held_modifiers,
-                            &self.selected_input_layers,
-                        ) =>
+                (
+                    ResolvedControlInput::Key(binding_key),
+                    RuntimeControlAction::Tap { point, sustain },
+                ) if binding_key == key
+                    && binding_available(
+                        control,
+                        physical,
+                        self.active_layers,
+                        self.held_modifiers,
+                        &self.selected_input_layers,
+                    ) =>
                 {
-                    tap_binding(
-                        &mut self.engine,
-                        point_contact(self.point_contacts[index])?,
-                        &control.name,
-                        *point,
-                        self.trace_input,
-                    )?;
+                    let contact_id = point_contact(self.point_contacts[index])?;
+                    let binding_name = control.name.clone();
+                    let point = *point;
+                    if *sustain {
+                        // Tap-or-hold: contact goes down NOW and stays until
+                        // key release; a quick press reads as a plain tap.
+                        if self.sustained_taps[index].is_some() {
+                            continue;
+                        }
+                        engine_submit_down(&mut self.engine, contact_id, point)?;
+                        self.sustained_taps[index] = Some(contact_id);
+                        if self.trace_input {
+                            println!(
+                                "[trace] runtime tap binding={binding_name} contact={} down=({},{}) sustained",
+                                contact_id.get(),
+                                point.x,
+                                point.y
+                            );
+                        }
+                    } else {
+                        tap_binding(
+                            &mut self.engine,
+                            contact_id,
+                            &binding_name,
+                            point,
+                            self.trace_input,
+                        )?;
+                    }
                     submitted = true;
                 }
                 (
@@ -2723,14 +2756,25 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                 continue;
             }
             match &control.action {
-                RuntimeControlAction::Tap { point } => {
-                    tap_binding(
-                        &mut self.engine,
-                        point_contact(self.point_contacts[index])?,
-                        &control.name,
-                        *point,
-                        self.trace_input,
-                    )?;
+                RuntimeControlAction::Tap { point, sustain } => {
+                    let contact_id = point_contact(self.point_contacts[index])?;
+                    let binding_name = control.name.clone();
+                    let point = *point;
+                    if *sustain {
+                        if self.sustained_taps[index].is_some() {
+                            continue;
+                        }
+                        engine_submit_down(&mut self.engine, contact_id, point)?;
+                        self.sustained_taps[index] = Some(contact_id);
+                    } else {
+                        tap_binding(
+                            &mut self.engine,
+                            contact_id,
+                            &binding_name,
+                            point,
+                            self.trace_input,
+                        )?;
+                    }
                     submitted = true;
                 }
                 RuntimeControlAction::RadialSelect { center, target } => {
@@ -2777,6 +2821,45 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             Some(key) if self.held_keys.contains(*key) => *walk_scale,
             _ => 1.0,
         }
+    }
+
+    /// Lift every sustained tap bound to `physical` (key/button released).
+    fn release_sustained_taps(
+        &mut self,
+        physical: RuntimePhysicalInput,
+    ) -> GameSessionResult<bool> {
+        let mut submitted = false;
+        for index in 0..self.plan.controls.len() {
+            let Some(contact_id) = self.sustained_taps[index] else {
+                continue;
+            };
+            let matches_input = match (&self.control_inputs[index], &physical) {
+                (ResolvedControlInput::Key(bound), RuntimePhysicalInput::Key(pressed)) => {
+                    bound == pressed
+                }
+                (
+                    ResolvedControlInput::MouseButton(bound),
+                    RuntimePhysicalInput::MouseButton(pressed),
+                ) => bound == pressed,
+                _ => false,
+            };
+            if !matches_input {
+                continue;
+            }
+            self.sustained_taps[index] = None;
+            if self.engine.state().is_active(contact_id) {
+                self.engine.end_contact(contact_id)?;
+                if self.trace_input {
+                    println!(
+                        "[trace] runtime sustained tap {}={} released",
+                        self.plan.controls[index].name,
+                        contact_id.get()
+                    );
+                }
+                submitted = true;
+            }
+        }
+        Ok(submitted)
     }
 
     fn tick(&mut self) -> GameSessionResult<()> {
@@ -2931,6 +3014,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         self.selected_input_layers.fill(None);
         self.last_joystick_frame.fill(None);
         self.last_walk_scales.fill(1.0);
+        self.sustained_taps.fill(None);
         self.pending_radials.clear();
         if self.trace_input {
             println!(
@@ -3051,6 +3135,20 @@ fn apply_joystick_input<I: TouchInjector>(
     analog.x = analog.x / length * scale;
     analog.y = analog.y / length * scale;
     joystick.apply_analog(engine, analog)
+}
+
+/// Sustained-tap half: only the Down phase of a tap.
+fn engine_submit_down<I: TouchInjector>(
+    engine: &mut TouchEngine<I>,
+    contact_id: ContactId,
+    point: Point,
+) -> GameSessionResult<()> {
+    engine.submit(TouchFrame::single(TouchEvent::new(
+        contact_id,
+        TouchPhase::Down,
+        point,
+    )))?;
+    Ok(())
 }
 
 fn radial_down_phase<I: TouchInjector>(
@@ -3970,6 +4068,7 @@ mod tests {
                         key: "space".to_owned(),
                     },
                     action: ActionV2::Tap {
+                        hold: false,
                         point: NormalizedPoint { x: 0.7, y: 0.8 },
                     },
                 },
@@ -4380,6 +4479,7 @@ mod tests {
                     key: "esc".to_owned(),
                 },
                 action: ActionV2::Tap {
+                    hold: false,
                     point: NormalizedPoint { x: 0.5, y: 0.5 },
                 },
             }],
@@ -5249,7 +5349,7 @@ mod tests {
             modifier: modifier.map(str::to_owned),
             input,
             action: if tap {
-                ActionV2::Tap { point }
+                ActionV2::Tap { point, hold: false }
             } else {
                 ActionV2::Hold { point }
             },
@@ -5621,6 +5721,7 @@ mod tests {
                     },
                     action: ActionV2::Tap {
                         point: NormalizedPoint { x: 0.9, y: 0.3 },
+                        hold: false,
                     },
                 },
             ],
@@ -5825,10 +5926,15 @@ mod tests {
             runtime.engine.injector_mut().frames.clear();
             let submitted = send_key(&mut runtime, key, KeyTransition::Pressed);
             let frames = runtime.engine.injector().frames.len();
+            // Plain taps submit down+up at once; sustained taps (F is
+            // hold-enabled in this profile) submit only Down until release.
             assert!(
-                submitted && frames >= 2,
+                submitted && frames >= 1,
                 "key {key:?} produced submitted={submitted} frames={frames}"
             );
+            send_key(&mut runtime, key, KeyTransition::Released);
+            let total = runtime.engine.injector().frames.len();
+            assert!(total >= 2, "release completed gesture: {total} frames");
         }
         runtime.stop().unwrap();
     }
@@ -5875,6 +5981,7 @@ mod tests {
                     },
                     action: ActionV2::Tap {
                         point: NormalizedPoint { x: 0.1, y: 0.1 },
+                        hold: false,
                     },
                 }],
             },
@@ -5903,6 +6010,109 @@ mod tests {
         ));
         let phases = emitted_phases(&runtime);
         assert_eq!(phases, vec![TouchPhase::Down, TouchPhase::Up]);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn sustained_tap_down_on_press_up_on_release() {
+        let mut runtime = test_runtime(
+            vec![],
+            vec![BindingV2 {
+                name: "defuse".to_owned(),
+                layer: None,
+                modifier: None,
+                input: InputV2::Key {
+                    key: "f".to_owned(),
+                },
+                action: ActionV2::Tap {
+                    point: NormalizedPoint { x: 0.5, y: 0.5 },
+                    hold: true,
+                },
+            }],
+        );
+
+        // Press: only the Down phase; the contact stays.
+        assert!(send_key(
+            &mut runtime,
+            wroid_input::HostKey::F,
+            KeyTransition::Pressed
+        ));
+        assert_eq!(emitted_phases(&runtime), vec![TouchPhase::Down]);
+        assert_eq!(runtime.engine.state().active_contact_count(), 1);
+
+        // Release: the Up completes the gesture.
+        assert!(send_key(
+            &mut runtime,
+            wroid_input::HostKey::F,
+            KeyTransition::Released
+        ));
+        assert_eq!(
+            emitted_phases(&runtime),
+            vec![TouchPhase::Down, TouchPhase::Up]
+        );
+        assert_eq!(runtime.engine.state().active_contact_count(), 0);
+
+        // A second cycle works identically (no stuck state).
+        assert!(send_key(
+            &mut runtime,
+            wroid_input::HostKey::F,
+            KeyTransition::Pressed
+        ));
+        assert!(send_key(
+            &mut runtime,
+            wroid_input::HostKey::F,
+            KeyTransition::Released
+        ));
+        assert_eq!(
+            emitted_phases(&runtime),
+            vec![
+                TouchPhase::Down,
+                TouchPhase::Up,
+                TouchPhase::Down,
+                TouchPhase::Up
+            ]
+        );
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn plain_taps_still_fire_immediately() {
+        let mut runtime = test_runtime(
+            vec![],
+            vec![BindingV2 {
+                name: "plain".to_owned(),
+                layer: None,
+                modifier: None,
+                input: InputV2::Key {
+                    key: "r".to_owned(),
+                },
+                action: ActionV2::Tap {
+                    point: NormalizedPoint { x: 0.5, y: 0.5 },
+                    hold: false,
+                },
+            }],
+        );
+
+        assert!(send_key(
+            &mut runtime,
+            wroid_input::HostKey::R,
+            KeyTransition::Pressed
+        ));
+        assert_eq!(
+            emitted_phases(&runtime),
+            vec![TouchPhase::Down, TouchPhase::Up]
+        );
+
+        // Releasing the key must not duplicate anything for a plain tap.
+        send_key(
+            &mut runtime,
+            wroid_input::HostKey::R,
+            KeyTransition::Released,
+        );
+        assert_eq!(
+            emitted_phases(&runtime),
+            vec![TouchPhase::Down, TouchPhase::Up]
+        );
         runtime.stop().unwrap();
     }
 }

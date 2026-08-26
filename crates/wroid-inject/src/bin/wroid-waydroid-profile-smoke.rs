@@ -171,7 +171,8 @@ fn find_key_taps(profile: &ProfileV2, resolution: Resolution) -> Vec<KeyTapBindi
             if binding.layer.is_some() || binding.modifier.is_some() {
                 return None;
             }
-            let (InputV2::Key { key }, ActionV2::Tap { point }) = (&binding.input, &binding.action)
+            let (InputV2::Key { key }, ActionV2::Tap { point, .. }) =
+                (&binding.input, &binding.action)
             else {
                 return None;
             };
@@ -411,6 +412,7 @@ mod tests {
                     x: coordinate,
                     y: coordinate,
                 },
+                hold: false,
             },
         }
     }

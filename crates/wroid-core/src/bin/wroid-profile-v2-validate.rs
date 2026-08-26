@@ -122,7 +122,7 @@ fn binding_context(binding: &BindingV2) -> String {
 fn print_materialized_action(label: &str, action: &ActionV2, resolution: Resolution, depth: usize) {
     let indent = "  ".repeat(depth);
     match action {
-        ActionV2::Tap { point } => {
+        ActionV2::Tap { point, .. } => {
             println!("{indent}{label}: tap {}", point.materialize(resolution));
         }
         ActionV2::Hold { point } => {
@@ -239,6 +239,7 @@ mod tests {
             },
             action: ActionV2::Tap {
                 point: NormalizedPoint { x: 0.7, y: 0.3 },
+                hold: false,
             },
         };
 

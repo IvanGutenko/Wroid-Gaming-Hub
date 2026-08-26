@@ -834,11 +834,18 @@
     if (action.kind === "tap" || action.kind === "hold") {
       const verb = action.kind === "hold"
         ? "The Android contact stays down until the key or mouse button is released."
-        : "The Android contact is pressed and released immediately.";
+        : action.hold
+          ? "Quick presses tap; holding keeps the contact down until release."
+          : "The Android contact is pressed and released immediately.";
+      const styleField = action.kind === "tap"
+        ? selectField("tapStyle", "Press style", action.hold ? "hold" : "tap", [["tap", "Tap once"], ["hold", "Tap or hold"]])
+        : "";
       return `<div class="inspector-row">
         <div>${numberField("tapX", "X position", action.point.x)}</div>
         <div>${numberField("tapY", "Y position", action.point.y)}</div>
-      </div><p class="hint">${verb} Drag the marker to the matching button in the game HUD.</p>`;
+      </div>
+      ${styleField}
+      <p class="hint">${verb} Drag the marker to the matching button in the game HUD.</p>`;
     }
     if (action.kind === "radial_select") {
       const directions = [["up", "Up ↑"], ["down", "Down ↓"], ["left", "Left ←"], ["right", "Right →"]];
@@ -1029,6 +1036,10 @@
     if (action.kind === "tap" || action.kind === "hold") {
       wireChange("tapX", (value) => { action.point.x = normalized(value); }, number);
       wireChange("tapY", (value) => { action.point.y = normalized(value); }, number);
+      wireChange("tapStyle", (value) => {
+        if (value === "hold") action.hold = true;
+        else delete action.hold;
+      });
     } else if (action.kind === "radial_select") {
       wireChange("radialCenterX", (value) => { action.center.x = normalized(value); }, number);
       wireChange("radialCenterY", (value) => { action.center.y = normalized(value); }, number);

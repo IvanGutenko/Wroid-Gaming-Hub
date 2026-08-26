@@ -396,6 +396,8 @@ impl RuntimeControlBinding {
 pub enum RuntimeControlAction {
     Tap {
         point: Point,
+        /// Sustained tap: down on press, up on release.
+        sustain: bool,
     },
     Hold {
         point: Point,
@@ -521,8 +523,9 @@ fn materialize_action(
     next_contact_id: &mut u16,
 ) -> Result<RuntimeControlAction, RuntimeControlPlanError> {
     match &binding.action {
-        ActionV2::Tap { point } => Ok(RuntimeControlAction::Tap {
+        ActionV2::Tap { point, hold } => Ok(RuntimeControlAction::Tap {
             point: point.materialize(resolution),
+            sustain: *hold,
         }),
         ActionV2::Hold { point } => Ok(RuntimeControlAction::Hold {
             point: point.materialize(resolution),
@@ -689,6 +692,7 @@ mod tests {
             },
             action: ActionV2::Tap {
                 point: NormalizedPoint { x: 0.5, y: 0.5 },
+                hold: false,
             },
         }
     }
@@ -750,6 +754,7 @@ mod tests {
                     },
                     action: ActionV2::Tap {
                         point: NormalizedPoint { x: 0.86, y: 0.50 },
+                        hold: false,
                     },
                 },
                 BindingV2 {
@@ -830,7 +835,8 @@ mod tests {
         assert_eq!(
             &fire.action,
             &RuntimeControlAction::Tap {
-                point: Point { x: 1650, y: 540 }
+                point: Point { x: 1650, y: 540 },
+                sustain: false,
             }
         );
 
@@ -849,6 +855,7 @@ mod tests {
         profile.bindings[0].action = ActionV2::Macro {
             steps: vec![ActionV2::Tap {
                 point: NormalizedPoint { x: 0.5, y: 0.5 },
+                hold: false,
             }],
         };
 
@@ -1091,6 +1098,7 @@ mod tests {
             },
             action: ActionV2::Tap {
                 point: NormalizedPoint { x: 0.7, y: 0.5 },
+                hold: false,
             },
         });
 

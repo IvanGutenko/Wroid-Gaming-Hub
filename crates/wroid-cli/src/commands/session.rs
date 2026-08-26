@@ -157,7 +157,7 @@ fn describe_input(input: &InputV2, modifier: Option<HostKeyName>) -> String {
 #[cfg(test)]
 fn describe_action(action: &RuntimeControlAction) -> String {
     match action {
-        RuntimeControlAction::Tap { point } => format!("tap ({},{})", point.x, point.y),
+        RuntimeControlAction::Tap { point, .. } => format!("tap ({},{})", point.x, point.y),
         RuntimeControlAction::Hold { point } => format!("hold ({},{})", point.x, point.y),
         RuntimeControlAction::VirtualJoystick {
             joystick,
@@ -317,6 +317,7 @@ mod tests {
             },
             action: ActionV2::Tap {
                 point: NormalizedPoint { x: 0.7, y: 0.3 },
+                hold: false,
             },
         });
 
@@ -332,6 +333,7 @@ mod tests {
         profile.bindings[0].action = ActionV2::Macro {
             steps: vec![ActionV2::Tap {
                 point: NormalizedPoint { x: 0.5, y: 0.5 },
+                hold: false,
             }],
         };
 

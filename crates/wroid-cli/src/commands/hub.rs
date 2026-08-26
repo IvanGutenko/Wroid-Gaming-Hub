@@ -287,7 +287,10 @@ fn legacy_tap_starter(current: &ProfileV2) -> Option<ProfileV2> {
     let mut changed = false;
     for binding in &mut legacy.bindings {
         if let ActionV2::Hold { point } = &binding.action {
-            binding.action = ActionV2::Tap { point: *point };
+            binding.action = ActionV2::Tap {
+                point: *point,
+                hold: false,
+            };
             changed = true;
         }
     }

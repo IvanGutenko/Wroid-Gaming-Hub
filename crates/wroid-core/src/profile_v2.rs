@@ -265,6 +265,11 @@ pub enum InputV2 {
 pub enum ActionV2 {
     Tap {
         point: NormalizedPoint,
+        /// Press-and-hold support: the contact goes down on key press and up
+        /// on key release, so short presses read as taps and holds stay down
+        /// (defuse-style keys). Plain taps never set this.
+        #[serde(default)]
+        hold: bool,
     },
     Hold {
         point: NormalizedPoint,
@@ -533,7 +538,7 @@ fn validate_input(input: &InputV2, binding: &str, errors: &mut Vec<String>) {
 
 fn validate_action(action: &ActionV2, binding: &str, errors: &mut Vec<String>) {
     match action {
-        ActionV2::Tap { point } | ActionV2::Hold { point } => {
+        ActionV2::Tap { point, .. } | ActionV2::Hold { point } => {
             let kind = if matches!(action, ActionV2::Tap { .. }) {
                 "tap"
             } else {
