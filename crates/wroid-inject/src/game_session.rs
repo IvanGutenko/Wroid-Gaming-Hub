@@ -1737,6 +1737,7 @@ struct UnifiedRuntime<I: TouchInjector> {
     aim_controllers: Vec<Option<MouseAimController>>,
     aim_toggle_keys: Vec<Option<HostKeyName>>,
     last_joystick_frame: Vec<Option<Duration>>,
+    last_walk_scales: Vec<f64>,
     pending_radials: Vec<PendingRadial>,
     active_layers: u64,
     held_keys: ModifierMask,
@@ -1833,6 +1834,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             aim_controllers,
             aim_toggle_keys,
             last_joystick_frame: vec![None; control_count],
+            last_walk_scales: vec![1.0; control_count],
             pending_radials: Vec::new(),
             active_layers: 0,
             held_keys: ModifierMask::EMPTY,
@@ -2240,12 +2242,13 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             };
             let retained =
                 direction_intersection(self.directions[index], self.desired_directions[index]);
-            if self.directions[index] == retained {
+            let scale = self.joystick_walk_scale(index);
+            if self.directions[index] == retained && self.last_walk_scales[index] == scale {
                 continue;
             }
-            let scale = self.joystick_walk_scale(index);
             let frame_submitted =
                 apply_joystick_input(&mut self.engine, joystick, retained, scale)?;
+            self.last_walk_scales[index] = scale;
             submitted |= frame_submitted;
             if frame_submitted {
                 self.last_joystick_frame[index] = Some(now);
@@ -2297,12 +2300,14 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                     self.active_bindings[index] = true;
                 }
                 RuntimeControlAction::VirtualJoystick { joystick, .. }
-                    if self.directions[index] != self.desired_directions[index] =>
+                    if self.directions[index] != self.desired_directions[index]
+                        || self.last_walk_scales[index] != self.joystick_walk_scale(index) =>
                 {
                     let desired = self.desired_directions[index];
                     let scale = self.joystick_walk_scale(index);
                     let frame_submitted =
                         apply_joystick_input(&mut self.engine, joystick, desired, scale)?;
+                    self.last_walk_scales[index] = scale;
                     submitted |= frame_submitted;
                     if frame_submitted {
                         self.last_joystick_frame[index] = Some(now);
@@ -2497,6 +2502,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                     let scale = self.joystick_walk_scale(index);
                     let frame_submitted =
                         apply_joystick_input(&mut self.engine, joystick, desired, scale)?;
+                    self.last_walk_scales[index] = scale;
                     submitted |= frame_submitted;
                     if frame_submitted {
                         self.last_joystick_frame[index] = Some(now);
@@ -2742,6 +2748,7 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
         self.desired_bindings.fill(false);
         self.selected_input_layers.fill(None);
         self.last_joystick_frame.fill(None);
+        self.last_walk_scales.fill(1.0);
         self.pending_radials.clear();
         if self.trace_input {
             println!(
@@ -2840,11 +2847,17 @@ fn apply_joystick_input<I: TouchInjector>(
     input: DirectionalInput,
     scale: f64,
 ) -> Result<bool, TouchEngineError> {
+    // A scaled deflection must stay outside the dead zone, otherwise the
+    // stick would read as fully released and stop the character instead of
+    // walking slowly.
+    let floor = f64::from(joystick.dead_zone()) / f64::from(joystick.radius()) + 0.02;
+    let scale = scale.max(floor.min(1.0));
     if scale >= 1.0 {
         return joystick.apply(engine, input);
     }
     let Some(mut analog) = AnalogInput::from_directional(input) else {
-        return Ok(false);
+        // Neutral input keeps the original semantics (release the contact).
+        return joystick.apply(engine, input);
     };
     analog.x = (analog.x * scale).clamp(-1.0, 1.0);
     analog.y = (analog.y * scale).clamp(-1.0, 1.0);
@@ -5516,6 +5529,31 @@ mod tests {
         let walked_reach = center_y - i64::from(walked);
         assert!(full_reach > 0);
         assert!((walked_reach * 2 - full_reach).abs() <= 2);
+
+        // Releasing the walk key while W is still held must restore full
+        // deflection immediately (no stale slow position).
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::LeftShift,
+                KeyTransition::Released,
+            ))
+            .unwrap();
+        let restored = runtime.engine.injector().frames.last().unwrap().events()[0]
+            .position
+            .y;
+        assert_eq!(restored, full);
+
+        // And re-engaging walk mid-stride scales back down again.
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::LeftShift,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        let walked_again = runtime.engine.injector().frames.last().unwrap().events()[0]
+            .position
+            .y;
+        assert_eq!(walked_again, walked);
         runtime.stop().unwrap();
     }
 }
