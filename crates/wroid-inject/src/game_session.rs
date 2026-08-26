@@ -5611,4 +5611,39 @@ mod tests {
         );
         runtime.stop().unwrap();
     }
+
+    #[test]
+    fn user_profile_dispatches_editor_added_keys() {
+        let path =
+            std::path::PathBuf::from("/home/supergut/.config/wroid/profiles-v2/standoff-2.json");
+        if !path.exists() {
+            return;
+        }
+        let profile = wroid_core::profile_v2::ProfileV2::load_from_path(&path).unwrap();
+        let plan = RuntimeControlPlan::from_profile_v2(
+            &profile,
+            Resolution {
+                width: 1920,
+                height: 1080,
+            },
+        )
+        .unwrap();
+        let mut runtime = UnifiedRuntime::new(plan, RecordingInjector::default(), false).unwrap();
+        runtime.start().unwrap();
+
+        for key in [
+            wroid_input::HostKey::E,
+            wroid_input::HostKey::G,
+            wroid_input::HostKey::F,
+        ] {
+            runtime.engine.injector_mut().frames.clear();
+            let submitted = send_key(&mut runtime, key, KeyTransition::Pressed);
+            let frames = runtime.engine.injector().frames.len();
+            assert!(
+                submitted && frames >= 2,
+                "key {key:?} produced submitted={submitted} frames={frames}"
+            );
+        }
+        runtime.stop().unwrap();
+    }
 }
