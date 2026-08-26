@@ -321,6 +321,26 @@ fn handle_request(request: &Request, profile_path: &Path, token: &str) -> (Respo
             Ok(profile) => (Response::json(200, &profile), false),
             Err(error) => (Response::json(500, &json_error(&error.to_string())), false),
         },
+        // The frontend compares this against the mtime it loaded/saved to
+        // detect another editor window overwriting the file behind its back.
+        ("GET", "/api/profile-status") if authorized => match fs::metadata(profile_path) {
+            Ok(metadata) => {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0);
+                (
+                    Response::json(
+                        200,
+                        &serde_json::json!({"ok": true, "modified": modified}).to_string(),
+                    ),
+                    false,
+                )
+            }
+            Err(error) => (Response::json(500, &json_error(&error.to_string())), false),
+        },
         ("GET", "/api/profile-backup") if authorized => {
             let path = profile_backup_path(profile_path);
             match ProfileV2::load_from_path(&path) {
@@ -431,19 +451,27 @@ fn handle_request(request: &Request, profile_path: &Path, token: &str) -> (Respo
                 return (Response::json(422, &body), false);
             }
             match save_profile_with_backup(profile_path, &profile) {
-                Ok(changed) => (
-                    Response::json(
-                        200,
-                        &serde_json::json!({
-                            "ok": true,
-                            "message": if changed { "Profile saved" } else { "Profile unchanged" },
-                            "changed": changed,
-                            "backupAvailable": profile_backup_path(profile_path).is_file(),
-                        })
-                        .to_string(),
-                    ),
-                    false,
-                ),
+                Ok(changed) => {
+                    let modified = fs::metadata(profile_path)
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok())
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_millis() as u64);
+                    (
+                        Response::json(
+                            200,
+                            &serde_json::json!({
+                                "ok": true,
+                                "message": if changed { "Profile saved" } else { "Profile unchanged" },
+                                "changed": changed,
+                                "backupAvailable": profile_backup_path(profile_path).is_file(),
+                                "modified": modified,
+                            })
+                            .to_string(),
+                        ),
+                        false,
+                    )
+                }
                 Err(error) => (Response::json(500, &json_error(&error.to_string())), false),
             }
         }

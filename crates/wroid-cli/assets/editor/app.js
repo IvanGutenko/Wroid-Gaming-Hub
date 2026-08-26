@@ -1230,11 +1230,42 @@
     renderSetupGuide();
   }
 
+
+  async function refreshDiskModifiedAt() {
+    try {
+      const response = await fetch(api("/api/profile-status"), { cache: "no-store" });
+      if (!response.ok) return;
+      const result = await response.json();
+      if (typeof result.modified === "number") state.diskModifiedAt = result.modified;
+    } catch (error) {
+      // Status is a safety net only; saving proceeds when it is unavailable.
+    }
+  }
+
   async function saveProfile(closeAfter = false) {
     const errors = validateProfile();
     if (errors.length) {
       toast(errors[0], true);
       return false;
+    }
+    try {
+      const statusResponse = await fetch(api("/api/profile-status"), { cache: "no-store" });
+      if (statusResponse.ok) {
+        const status = await statusResponse.json();
+        if (
+          typeof status.modified === "number"
+          && state.diskModifiedAt != null
+          && status.modified !== state.diskModifiedAt
+        ) {
+          toast(
+            "The profile file changed outside this window (another editor?). Reload the page to pick up those changes before saving.",
+            true,
+          );
+          return false;
+        }
+      }
+    } catch (error) {
+      // Status is a safety net; save without it rather than never.
     }
     state.saving = true;
     state.savingStartedAt = Date.now();
@@ -1252,6 +1283,7 @@
       }
       state.dirty = false;
       state.backupAvailable = Boolean(result.backupAvailable);
+      if (typeof result.modified === "number") state.diskModifiedAt = result.modified;
       toast(result.changed === false ? "Profile already matches the saved map." : "Profile saved. Previous map retained.");
       if (closeAfter) {
         await fetch(api("/api/close"), { method: "POST" });
@@ -1919,6 +1951,7 @@
       const response = await fetch(api("/api/profile"), { cache: "no-store" });
       if (!response.ok) throw new Error(`Editor authorization failed (${response.status}).`);
       state.profile = Model.normalizeProfile(await response.json());
+      await refreshDiskModifiedAt();
       state.selectedLayer = null;
       state.selected = state.profile.bindings.findIndex(bindingInSelectedLayer);
       const startupWarnings = [];
