@@ -134,12 +134,14 @@ fn print_materialized_action(label: &str, action: &ActionV2, resolution: Resolut
             dead_zone,
             mode,
             reaffirm_ms,
+            slow_key,
+            slow_scale,
         } => {
             let center = center.materialize(resolution);
             let radius_px = materialize_radius(*radius, resolution);
             let dead_zone_px = materialize_dead_zone(*dead_zone, radius_px, resolution);
             println!(
-                "{indent}{label}: virtual_joystick center={center} radius={radius_px}px dead_zone={dead_zone_px}px mode={mode:?} reaffirm_ms={reaffirm_ms:?}"
+                "{indent}{label}: virtual_joystick center={center} radius={radius_px}px dead_zone={dead_zone_px}px mode={mode:?} reaffirm_ms={reaffirm_ms:?} slow_key={slow_key:?} slow_scale={slow_scale:?}"
             );
         }
         ActionV2::MouseAim {

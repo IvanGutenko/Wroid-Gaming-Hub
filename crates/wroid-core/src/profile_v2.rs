@@ -278,6 +278,13 @@ pub enum ActionV2 {
         mode: JoystickMode,
         #[serde(default)]
         reaffirm_ms: Option<u64>,
+        /// While this key is held the stick deflects only `slow_scale` of
+        /// its radius (slow walk). Game-specific: other titles use Shift
+        /// for sprint instead, so it stays opt-in per profile.
+        #[serde(default)]
+        slow_key: Option<String>,
+        #[serde(default)]
+        slow_scale: Option<f64>,
     },
     MouseAim {
         region: NormalizedRect,
@@ -539,6 +546,8 @@ fn validate_action(action: &ActionV2, binding: &str, errors: &mut Vec<String>) {
             radius,
             dead_zone,
             reaffirm_ms,
+            slow_key,
+            slow_scale,
             ..
         } => {
             validate_point(
@@ -563,6 +572,16 @@ fn validate_action(action: &ActionV2, binding: &str, errors: &mut Vec<String>) {
             if matches!(reaffirm_ms, Some(0)) {
                 errors.push(format!(
                     "binding {binding} virtual_joystick reaffirm_ms must be greater than zero"
+                ));
+            }
+            if slow_key.as_deref().is_some_and(|key| !known_key_name(key)) {
+                errors.push(format!(
+                    "binding {binding} virtual_joystick slow_key must be a supported key name"
+                ));
+            }
+            if slow_scale.is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1.0) {
+                errors.push(format!(
+                    "binding {binding} virtual_joystick slow_scale must be finite and within 0.0..=1.0"
                 ));
             }
         }
@@ -1301,6 +1320,8 @@ mod tests {
             dead_zone: 0.09,
             mode: JoystickMode::Hold,
             reaffirm_ms: Some(50),
+            slow_key: None,
+            slow_scale: None,
         };
 
         let error = profile.validate().unwrap_err();

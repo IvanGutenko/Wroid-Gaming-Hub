@@ -392,7 +392,7 @@ impl RuntimeControlBinding {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeControlAction {
     Tap {
         point: Point,
@@ -404,6 +404,8 @@ pub enum RuntimeControlAction {
         joystick: VirtualJoystick,
         mode: JoystickMode,
         reaffirm_interval: Option<Duration>,
+        slow_key: Option<HostKeyName>,
+        walk_scale: f64,
     },
     MouseAim {
         aim: MouseAim,
@@ -531,6 +533,8 @@ fn materialize_action(
             dead_zone,
             mode,
             reaffirm_ms,
+            slow_key,
+            slow_scale,
         } => {
             let contact_id = allocate_contact_id(next_contact_id);
             let joystick = VirtualJoystick::from_profile_v2_geometry(
@@ -540,10 +544,19 @@ fn materialize_action(
                 binding: binding.name.clone(),
                 source,
             })?;
+            let slow_key = slow_key.as_deref().and_then(HostKeyName::parse);
+            // A slow key without an explicit scale walks at half speed.
+            let walk_scale = if slow_key.is_some() {
+                slow_scale.unwrap_or(0.5)
+            } else {
+                1.0
+            };
             Ok(RuntimeControlAction::VirtualJoystick {
                 joystick,
                 mode: mode.clone(),
                 reaffirm_interval: reaffirm_ms.map(Duration::from_millis),
+                slow_key,
+                walk_scale,
             })
         }
         ActionV2::MouseAim {
@@ -704,6 +717,8 @@ mod tests {
                         dead_zone: 0.02,
                         mode: JoystickMode::Hold,
                         reaffirm_ms: Some(50),
+                        slow_key: Some("shift".to_owned()),
+                        slow_scale: Some(0.5),
                     },
                 },
                 BindingV2 {
@@ -771,6 +786,7 @@ mod tests {
             joystick,
             mode,
             reaffirm_interval,
+            ..
         } = &movement.action
         else {
             panic!("movement should materialize as a virtual joystick");

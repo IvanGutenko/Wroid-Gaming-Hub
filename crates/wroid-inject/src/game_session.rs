@@ -24,10 +24,10 @@ use wroid_input::mouse::{
 };
 use wroid_input::{EvdevKeyboard, HostKey, HostKeyEvent, KeyTransition};
 use wroid_runtime::{
-    ContactId, DirectionalInput, HostKeyName, HostMouseButton, LayerId, LayerMode, ModifierMask,
-    MouseAimController, MouseAimDelta, MouseAimUpdate, RuntimeControlAction, RuntimeControlBinding,
-    RuntimeControlPlan, RuntimePhysicalInput, TouchEngine, TouchEvent, TouchFrame,
-    TouchInjectionError, TouchInjector, TouchPhase,
+    AnalogInput, ContactId, DirectionalInput, HostKeyName, HostMouseButton, LayerId, LayerMode,
+    ModifierMask, MouseAimController, MouseAimDelta, MouseAimUpdate, RuntimeControlAction,
+    RuntimeControlBinding, RuntimeControlPlan, RuntimePhysicalInput, TouchEngine, TouchEngineError,
+    TouchEvent, TouchFrame, TouchInjectionError, TouchInjector, TouchPhase,
 };
 
 const DEFAULT_WIDTH: u32 = 1920;
@@ -2243,7 +2243,9 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             if self.directions[index] == retained {
                 continue;
             }
-            let frame_submitted = joystick.apply(&mut self.engine, retained)?;
+            let scale = self.joystick_walk_scale(index);
+            let frame_submitted =
+                apply_joystick_input(&mut self.engine, joystick, retained, scale)?;
             submitted |= frame_submitted;
             if frame_submitted {
                 self.last_joystick_frame[index] = Some(now);
@@ -2298,7 +2300,9 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                     if self.directions[index] != self.desired_directions[index] =>
                 {
                     let desired = self.desired_directions[index];
-                    let frame_submitted = joystick.apply(&mut self.engine, desired)?;
+                    let scale = self.joystick_walk_scale(index);
+                    let frame_submitted =
+                        apply_joystick_input(&mut self.engine, joystick, desired, scale)?;
                     submitted |= frame_submitted;
                     if frame_submitted {
                         self.last_joystick_frame[index] = Some(now);
@@ -2490,7 +2494,9 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
                     if !changed {
                         continue;
                     }
-                    let frame_submitted = joystick.apply(&mut self.engine, desired)?;
+                    let scale = self.joystick_walk_scale(index);
+                    let frame_submitted =
+                        apply_joystick_input(&mut self.engine, joystick, desired, scale)?;
                     submitted |= frame_submitted;
                     if frame_submitted {
                         self.last_joystick_frame[index] = Some(now);
@@ -2566,6 +2572,23 @@ impl<I: TouchInjector> UnifiedRuntime<I> {
             }
         }
         Ok(submitted)
+    }
+
+    /// Walk-key scale for the binding: `walk_scale` while its slow key is
+    /// held, full deflection otherwise.
+    fn joystick_walk_scale(&self, index: usize) -> f64 {
+        let RuntimeControlAction::VirtualJoystick {
+            slow_key,
+            walk_scale,
+            ..
+        } = &self.plan.controls[index].action
+        else {
+            return 1.0;
+        };
+        match slow_key {
+            Some(key) if self.held_keys.contains(*key) => *walk_scale,
+            _ => 1.0,
+        }
     }
 
     fn tick(&mut self) -> GameSessionResult<()> {
@@ -2807,6 +2830,25 @@ struct PendingRadial {
     target: Point,
     phase: RadialPhase,
     due_at: Duration,
+}
+
+/// Applies one joystick direction; a scale below 1.0 shrinks the analog
+/// deflection (slow walk) while keeping full deflection at 1.0.
+fn apply_joystick_input<I: TouchInjector>(
+    engine: &mut TouchEngine<I>,
+    joystick: &wroid_runtime::VirtualJoystick,
+    input: DirectionalInput,
+    scale: f64,
+) -> Result<bool, TouchEngineError> {
+    if scale >= 1.0 {
+        return joystick.apply(engine, input);
+    }
+    let Some(mut analog) = AnalogInput::from_directional(input) else {
+        return Ok(false);
+    };
+    analog.x = (analog.x * scale).clamp(-1.0, 1.0);
+    analog.y = (analog.y * scale).clamp(-1.0, 1.0);
+    joystick.apply_analog(engine, analog)
 }
 
 fn radial_down_phase<I: TouchInjector>(
@@ -5087,6 +5129,8 @@ mod tests {
                 dead_zone: 0.02,
                 mode: JoystickMode::Hold,
                 reaffirm_ms: Some(50),
+                slow_key: None,
+                slow_scale: None,
             },
         }
     }
@@ -5404,6 +5448,74 @@ mod tests {
             .unwrap();
         assert!(runtime.pending_radials.is_empty());
         assert_eq!(runtime.engine.state().active_contact_count(), 0);
+        runtime.stop().unwrap();
+    }
+
+    #[test]
+    fn walk_key_shrinks_joystick_deflection() {
+        let mut runtime = test_runtime(
+            vec![],
+            vec![BindingV2 {
+                name: "movement".to_owned(),
+                layer: None,
+                modifier: None,
+                input: InputV2::KeyCluster {
+                    up: "w".to_owned(),
+                    left: "a".to_owned(),
+                    down: "s".to_owned(),
+                    right: "d".to_owned(),
+                },
+                action: ActionV2::VirtualJoystick {
+                    center: NormalizedPoint { x: 0.5, y: 0.8 },
+                    radius: 0.1,
+                    dead_zone: 0.0,
+                    mode: JoystickMode::Hold,
+                    reaffirm_ms: Some(50),
+                    slow_key: Some("shift".to_owned()),
+                    slow_scale: Some(0.5),
+                },
+            }],
+        );
+
+        // Full deflection without the walk key.
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::W,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        let full = runtime.engine.injector().frames.last().unwrap().events()[0]
+            .position
+            .y;
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::W,
+                KeyTransition::Released,
+            ))
+            .unwrap();
+
+        // Hold the walk key: same direction, half the distance from center.
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::LeftShift,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::W,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        let walked = runtime.engine.injector().frames.last().unwrap().events()[0]
+            .position
+            .y;
+
+        let center_y = 800; // 0.8 * 1000
+        let full_reach = center_y - i64::from(full);
+        let walked_reach = center_y - i64::from(walked);
+        assert!(full_reach > 0);
+        assert!((walked_reach * 2 - full_reach).abs() <= 2);
         runtime.stop().unwrap();
     }
 }

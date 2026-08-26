@@ -359,6 +359,8 @@ mod tests {
                         dead_zone: 0.02,
                         mode: JoystickMode::Hold,
                         reaffirm_ms: Some(50),
+                        slow_key: None,
+                        slow_scale: None,
                     },
                 },
                 BindingV2 {

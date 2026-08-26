@@ -22,7 +22,9 @@
         "radius": 0.1,
         "dead_zone": 0.02,
         "mode": "hold",
-        "reaffirm_ms": 50
+        "reaffirm_ms": 50,
+        "slow_key": "shift",
+        "slow_scale": 0.45
       }
     },
     {

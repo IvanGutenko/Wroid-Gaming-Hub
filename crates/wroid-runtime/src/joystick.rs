@@ -52,7 +52,7 @@ impl AnalogInput {
         Self { x, y }
     }
 
-    fn from_directional(input: DirectionalInput) -> Option<Self> {
+    pub fn from_directional(input: DirectionalInput) -> Option<Self> {
         let x = f64::from(input.horizontal());
         let y = f64::from(input.vertical());
         if x == 0.0 && y == 0.0 {

@@ -163,6 +163,7 @@ fn describe_action(action: &RuntimeControlAction) -> String {
             joystick,
             mode,
             reaffirm_interval,
+            ..
         } => format!(
             "virtual_joystick center=({},{}) radius={} dead_zone={} contact={} mode={mode:?} reaffirm_ms={:?}",
             joystick.center().x,
@@ -224,6 +225,8 @@ mod tests {
                         dead_zone: 0.02,
                         mode: Default::default(),
                         reaffirm_ms: Some(50),
+                        slow_key: None,
+                        slow_scale: None,
                     },
                 },
                 BindingV2 {

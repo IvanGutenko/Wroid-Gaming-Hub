@@ -863,6 +863,10 @@
         </div>
         ${selectField("stickMode", "Activation mode", action.mode || "hold", [["hold", "Hold"], ["toggle", "Toggle"]])}
         ${numberField("stickReaffirm", "Reaffirm interval (ms)", action.reaffirm_ms ?? 50, 1, 5000, 1)}
+        <div class="inspector-row">
+          <div>${keyCaptureField("stickSlowKey", "Slow walk key", action.slow_key ?? "", "Backspace clears it.")}</div>
+          <div>${numberField("stickSlowScale", "Walk speed (0-1)", action.slow_scale ?? 0.5, 0.05, 1, 0.05)}</div>
+        </div>
         <p class="hint">The radius is relative to the shorter surface edge. Drag the ring handle to resize.</p>`;
     }
     return `<div class="inspector-row">
@@ -1042,6 +1046,15 @@
       }, number);
       wireChange("stickMode", (value) => { action.mode = value; });
       wireChange("stickReaffirm", (value) => { action.reaffirm_ms = Math.max(1, Math.round(value)); }, number);
+      wireKeyCapture("stickSlowKey", (value) => {
+        if (value) action.slow_key = value;
+        else delete action.slow_key;
+      }, { allowEmpty: true });
+      wireChange("stickSlowScale", (value) => {
+        const scale = rounded(clamp(value, 0.05, 1), 2);
+        if (scale < 1) action.slow_scale = scale;
+        else delete action.slow_scale;
+      }, number);
     } else if (action.kind === "mouse_aim") {
       wireChange("aimX", (value) => {
         action.region.x = rounded(clamp(value, 0, 1 - action.region.w));
