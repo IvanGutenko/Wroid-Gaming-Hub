@@ -2859,8 +2859,15 @@ fn apply_joystick_input<I: TouchInjector>(
         // Neutral input keeps the original semantics (release the contact).
         return joystick.apply(engine, input);
     };
-    analog.x = (analog.x * scale).clamp(-1.0, 1.0);
-    analog.y = (analog.y * scale).clamp(-1.0, 1.0);
+    // Scale the vector LENGTH, not the components: a diagonal whose
+    // components are scaled keeps sqrt(2) times the magnitude and reads as
+    // a fast run. Direction-independent magnitude = uniform walk speed.
+    let length = analog.x.hypot(analog.y);
+    if length == 0.0 || !length.is_finite() {
+        return joystick.apply(engine, input);
+    }
+    analog.x = analog.x / length * scale;
+    analog.y = analog.y / length * scale;
     joystick.apply_analog(engine, analog)
 }
 
@@ -5554,6 +5561,54 @@ mod tests {
             .position
             .y;
         assert_eq!(walked_again, walked);
+
+        // Diagonal while walking: W+D under Shift must also stay scaled.
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::LeftShift,
+                KeyTransition::Released,
+            ))
+            .unwrap();
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::D,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::LeftShift,
+                KeyTransition::Pressed,
+            ))
+            .unwrap();
+        let diag_walked = runtime.engine.injector().frames.last().unwrap().events()[0].position;
+        // Full-speed diagonal reference for comparison.
+        runtime
+            .handle_keyboard(HostKeyEvent::new(
+                wroid_input::HostKey::LeftShift,
+                KeyTransition::Released,
+            ))
+            .unwrap();
+        let diag_full = runtime.engine.injector().frames.last().unwrap().events()[0].position;
+        let center_x = 500_i64; // 0.5 * 1000
+        let walked_dx = i64::from(diag_walked.x) - center_x;
+        let full_dx = i64::from(diag_full.x) - center_x;
+        assert!(full_dx > 0);
+        for (i, f) in runtime
+            .engine
+            .injector()
+            .frames
+            .iter()
+            .enumerate()
+            .skip(runtime.engine.injector().frames.len() - 6)
+        {
+            eprintln!("frame {i}: {:?}", f.events());
+        }
+        eprintln!("diag_walked={diag_walked:?} diag_full={diag_full:?}");
+        assert!(
+            (walked_dx * 2 - full_dx).abs() <= 4,
+            "walked dx {walked_dx} should be ~half of full dx {full_dx}"
+        );
         runtime.stop().unwrap();
     }
 }
