@@ -11,6 +11,7 @@ mod error;
 mod event;
 mod game_session;
 mod injector;
+mod kwin_pointer_isolation;
 #[allow(private_interfaces)]
 mod live_keyboard;
 mod live_mouse_aim;

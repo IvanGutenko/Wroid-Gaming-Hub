@@ -223,11 +223,16 @@ fn accept_client(
                 stream
                     .set_write_timeout(Some(Duration::from_secs(1)))
                     .context("failed to configure focus client")?;
-                if let Some(focused) = last_focus {
-                    stream
-                        .write_all(&focus_line(focused, last_output))
-                        .context("failed to initialize focus client")?;
-                }
+                // The KWin callback can lag behind socket startup while the
+                // compositor is busy creating/fullscreening the Waydroid
+                // surface. Always complete the handshake immediately and
+                // fail closed until the first authoritative callback arrives.
+                // Previously the worker timed out with EAGAIN, disabled focus
+                // protection for the whole session, and kept input captured
+                // even when another monitor gained focus.
+                stream
+                    .write_all(&focus_line(last_focus.unwrap_or(false), last_output))
+                    .context("failed to initialize focus client")?;
                 *client = Some(stream);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
@@ -474,6 +479,23 @@ fn random_token() -> Result<String> {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn client_handshake_fails_closed_before_kwin_reports_focus() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("focus.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = UnixStream::connect(&socket_path).unwrap();
+        let mut accepted = None;
+
+        accept_client(&listener, &mut accepted, None, None).unwrap();
+
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        assert_eq!(line, "unfocused\n");
+        assert!(accepted.is_some());
+    }
 
     #[test]
     fn script_matches_waydroid_and_reports_process_identity() {

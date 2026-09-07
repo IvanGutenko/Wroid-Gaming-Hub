@@ -1513,6 +1513,7 @@ dependencies = [
 name = "wroid-inject"
 version = "0.1.0"
 dependencies = [
+ "dbus",
  "evdev",
  "libc",
  "serde",

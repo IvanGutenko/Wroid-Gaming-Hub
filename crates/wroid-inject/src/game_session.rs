@@ -10,6 +10,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::kwin_pointer_isolation::KwinInputIsolation;
 use crate::privileged_bridge::{settle_wroid_input_udev, AndroidInputAccess};
 use crate::{
     ensure_container_stopped, ensure_root, gamescope_is_available, presentation_for_game,
@@ -88,8 +89,16 @@ fn reload_profile_if_changed<I: TouchInjector>(
     swapped
 }
 
-const INPUT_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Reply deadline for input-reader control commands. The mouse mode path
+/// runs a KWin DBus pair (set + verify get, each bounded by `DBUS_TIMEOUT`)
+/// plus an isolation watchdog spawn inside the reader, so the deadline must
+/// exceed that worst case instead of racing it: a timed-out control aborts
+/// the whole game session, which is worse than a slow capture toggle.
+const INPUT_CONTROL_TIMEOUT: Duration = Duration::from_secs(8);
 const FOCUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Short socket read slices let the focus handshake tolerate a delayed KWin
+/// callback without surfacing the intermediate EAGAIN as a permanent failure.
+const FOCUS_READ_SLICE: Duration = Duration::from_millis(250);
 /// Grace period for a connected focus relay to report its first window event.
 /// A relay that stays silent past this leaves the session dead (no grabs, no
 /// input), so the loop degrades to manual F12 capture instead of waiting
@@ -209,6 +218,15 @@ pub fn run_game_session(mut options: GameSessionOptions) -> GameSessionResult<Ga
         .as_deref()
         .map(EvdevMouse::open)
         .transpose()?;
+    let mut pointer_isolation = if options.grab {
+        mouse
+            .as_ref()
+            .map(|mouse| KwinInputIsolation::for_pointer_evdev(mouse.path()))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     let config = DeviceConfig::new(options.width, options.height)?;
     let session_resolution = Resolution {
         width: config.width(),
@@ -244,6 +262,17 @@ pub fn run_game_session(mut options: GameSessionOptions) -> GameSessionResult<Ga
         broker.open(&event_node)?;
         SessionBridge::Broker(broker)
     };
+    // KWin discovers the host side of this uinput touchscreen too. Unless it
+    // is excluded from the compositor, every Android touch is also delivered
+    // to the desktop at the corresponding absolute coordinate.
+    let mut touchscreen_isolation = KwinInputIsolation::for_touchscreen_evdev(&event_node)?;
+    if let Some(isolation) = touchscreen_isolation.as_mut() {
+        isolation.set_isolated(true)?;
+        println!(
+            "Host touch isolation: KWin {} disabled for the Android-only touchscreen.",
+            isolation.sys_name()
+        );
+    }
     let desktop_user = DesktopUser::from_session_environment()?;
     let gamescope_available = gamescope_is_available();
     let presentation = presentation_for_game(
@@ -316,7 +345,9 @@ pub fn run_game_session(mut options: GameSessionOptions) -> GameSessionResult<Ga
         if options.grab && initially_focused {
             keyboard.grab()?;
             if let Some(mouse) = mouse.as_mut() {
-                mouse.grab()?;
+                update_mouse_capture(mouse, pointer_isolation.as_mut(), true).map_err(
+                    |message| io::Error::other(format!("mouse capture failed: {message}")),
+                )?;
             }
         }
 
@@ -329,6 +360,12 @@ pub fn run_game_session(mut options: GameSessionOptions) -> GameSessionResult<Ga
         );
         if let Some(mouse) = mouse.as_ref() {
             println!("Mouse: {} ({})", mouse.name(), mouse.path().display());
+            if let Some(isolation) = pointer_isolation.as_ref() {
+                println!(
+                    "Pointer isolation: KWin {} is disabled while input is captured.",
+                    isolation.sys_name()
+                );
+            }
         } else {
             println!("Mouse: not required by this profile");
         }
@@ -360,7 +397,14 @@ pub fn run_game_session(mut options: GameSessionOptions) -> GameSessionResult<Ga
         let keyboard_control = spawn_keyboard_reader(keyboard, sender.clone(), input_active);
         let mut mouse_control = None;
         if let Some(mouse) = mouse {
-            mouse_control = Some(spawn_mouse_reader(mouse, sender.clone(), input_active));
+            let initially_grabbed = mouse.is_grabbed();
+            mouse_control = Some(spawn_mouse_reader(
+                mouse,
+                sender.clone(),
+                input_active,
+                initially_grabbed,
+                pointer_isolation,
+            ));
         }
         let mut game_output: Option<String> = None;
         let focus_receiver = focus_connection.map(|connection| {
@@ -828,21 +872,25 @@ fn keyboard_events_for_capture(events: Vec<HostKeyEvent>, captured: bool) -> Vec
 fn spawn_mouse_reader(
     mut mouse: EvdevMouse,
     sender: Sender<HostEvent>,
-    captured: bool,
+    initial_forwarding: bool,
+    initial_grabbed: bool,
+    mut pointer_isolation: Option<KwinInputIsolation>,
 ) -> Sender<InputReaderCommand> {
     let (control, commands) = mpsc::channel();
     let mouse_fd = mouse.as_raw_fd();
-    let mut forwarding = captured;
-    let mut grabbed = captured; // Assuming initial capture implies both.
+    let mut forwarding = initial_forwarding;
+    // Track the real EVIOCGRAB state instead of assuming that logical input
+    // forwarding and physical compositor exclusion are the same thing.
+    let mut grabbed = initial_grabbed;
     thread::spawn(move || loop {
         match commands.try_recv() {
             Ok(InputReaderCommand::SetCapture { enabled, reply }) => {
-                let result = update_mouse_capture(&mut mouse, enabled);
+                let result = update_mouse_capture(&mut mouse, pointer_isolation.as_mut(), enabled);
                 if result.is_ok() {
                     forwarding = enabled;
                     grabbed = enabled;
                 }
-                let _ = reply.send(result.map_err(|error| error.to_string()));
+                let _ = reply.send(result);
             }
             Ok(InputReaderCommand::SetMouseMode {
                 forward,
@@ -850,13 +898,7 @@ fn spawn_mouse_reader(
                 reply,
             }) => {
                 let result = if grab != grabbed {
-                    if grab {
-                        let _ = drain_mouse(&mut mouse);
-                        mouse.grab()
-                    } else {
-                        mouse.ungrab()
-                    }
-                    .map_err(|e| e.to_string())
+                    update_mouse_capture(&mut mouse, pointer_isolation.as_mut(), grab)
                 } else {
                     Ok(())
                 };
@@ -903,12 +945,12 @@ fn spawn_mouse_reader(
         wait_for_input(mouse_fd, INPUT_READER_WAIT_MS);
         match commands.try_recv() {
             Ok(InputReaderCommand::SetCapture { enabled, reply }) => {
-                let result = update_mouse_capture(&mut mouse, enabled);
+                let result = update_mouse_capture(&mut mouse, pointer_isolation.as_mut(), enabled);
                 if result.is_ok() {
                     forwarding = enabled;
                     grabbed = enabled;
                 }
-                let _ = reply.send(result.map_err(|error| error.to_string()));
+                let _ = reply.send(result);
             }
             Ok(InputReaderCommand::SetMouseMode {
                 forward,
@@ -916,13 +958,7 @@ fn spawn_mouse_reader(
                 reply,
             }) => {
                 let result = if grab != grabbed {
-                    if grab {
-                        let _ = drain_mouse(&mut mouse);
-                        mouse.grab()
-                    } else {
-                        mouse.ungrab()
-                    }
-                    .map_err(|e| e.to_string())
+                    update_mouse_capture(&mut mouse, pointer_isolation.as_mut(), grab)
                 } else {
                     Ok(())
                 };
@@ -953,13 +989,35 @@ fn update_keyboard_capture(
 
 fn update_mouse_capture(
     mouse: &mut EvdevMouse,
+    pointer_isolation: Option<&mut KwinInputIsolation>,
     enabled: bool,
-) -> Result<(), wroid_input::mouse::MouseDeviceError> {
+) -> Result<(), String> {
     if enabled {
-        drain_mouse(mouse)?;
-        mouse.grab()
+        drain_mouse(mouse).map_err(|error| error.to_string())?;
+        mouse.grab().map_err(|error| error.to_string())?;
+        if let Some(isolation) = pointer_isolation {
+            if let Err(error) = isolation.set_isolated(true) {
+                let _ = mouse.ungrab();
+                return Err(error.to_string());
+            }
+        }
+        Ok(())
     } else {
-        mouse.ungrab()
+        let ungrab = mouse.ungrab().map_err(|error| error.to_string());
+        let restore = pointer_isolation
+            .map(|isolation| {
+                isolation
+                    .set_isolated(false)
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap_or(Ok(()));
+        match (ungrab, restore) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(ungrab), Err(restore)) => Err(format!(
+                "{ungrab}; KWin pointer restore also failed: {restore}"
+            )),
+        }
     }
 }
 
@@ -1040,7 +1098,7 @@ struct FocusConnection {
 impl FocusConnection {
     fn connect(path: &Path) -> io::Result<Self> {
         let stream = UnixStream::connect(path)?;
-        stream.set_read_timeout(Some(FOCUS_CONNECT_TIMEOUT))?;
+        stream.set_read_timeout(Some(FOCUS_READ_SLICE))?;
         let mut reader = BufReader::new(stream);
         // The relay emits its initial focus state and may attach an
         // `output <name>` metadata line before or after it. Line order is
@@ -1057,11 +1115,23 @@ impl FocusConnection {
                 ));
             }
             let mut line = String::new();
-            if reader.read_line(&mut line)? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "focus relay closed before reporting initial state",
-                ));
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "focus relay closed before reporting initial state",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
             }
             match classify_relay_line(&line)? {
                 RelayLine::State(value) => focused = Some(value),
@@ -1077,8 +1147,13 @@ impl FocusConnection {
         match reader.read_line(&mut trailing) {
             Ok(0) | Err(_) => {}
             Ok(_) => {
-                if let Ok(RelayLine::Output(name)) = classify_relay_line(&trailing) {
-                    output = Some(name);
+                match classify_relay_line(&trailing) {
+                    Ok(RelayLine::Output(name)) => output = Some(name),
+                    // The relay deliberately handshakes as unfocused when
+                    // KWin has not answered yet. Do not swallow an immediate
+                    // authoritative state update during the metadata probe.
+                    Ok(RelayLine::State(value)) => focused = Some(value),
+                    Err(_) => {}
                 }
             }
         }
@@ -3809,6 +3884,40 @@ mod tests {
         let connection = FocusConnection::connect(&socket_path).unwrap();
         assert!(connection.focused);
         assert_eq!(connection.output.as_deref(), Some("DP-2"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn focus_handshake_retries_after_a_socket_read_slice_times_out() {
+        use std::io::Write as _;
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("delayed-focus-relay.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            thread::sleep(FOCUS_READ_SLICE + Duration::from_millis(50));
+            stream.write_all(b"focused\n").unwrap();
+        });
+
+        let connection = FocusConnection::connect(&socket_path).unwrap();
+        assert!(connection.focused);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn focus_handshake_keeps_immediate_state_after_fail_closed_default() {
+        use std::io::Write as _;
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("updated-focus-relay.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"unfocused\nfocused\n").unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let connection = FocusConnection::connect(&socket_path).unwrap();
+        assert!(connection.focused);
         server.join().unwrap();
     }
 
