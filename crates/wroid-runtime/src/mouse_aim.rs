@@ -331,6 +331,16 @@ pub struct MouseAimSettings {
     pub reaffirm_interval: Option<Duration>,
 }
 
+/// Fraction (milli) of the travel budget after which the contact may be
+/// replaced at a motion stillness instead of waiting for the hard budget.
+const SOFT_RECENTER_MILLI: i64 = 500;
+/// Quiet time the mouse must stay motionless before a lull recenter fires.
+/// Quiet *events* do not qualify: the acceleration ramp of a fresh stroke
+/// produces them, and a swap there makes the game bind its look gesture
+/// exactly when the fast part of the stroke needs a live touch — the stroke
+/// is then read as a tap and the turn barely rotates.
+const RECENTER_STILLNESS: Duration = Duration::from_millis(40);
+
 impl Default for MouseAimSettings {
     fn default() -> Self {
         Self {
@@ -375,6 +385,9 @@ pub struct MouseAimController {
     ads_active: bool,
     recenter_count: u64,
     last_reaffirm_at: Option<Duration>,
+    /// Last instant aim motion was applied; the stillness recenter fires
+    /// only once the mouse has been quiet since this instant.
+    last_motion_at: Option<Duration>,
     accumulator: ScaleAccumulator,
     /// Scaled touch travel accumulated by the current contact since its
     /// down event; the relocation budget is measured against this.
@@ -407,20 +420,30 @@ impl MouseAimController {
             ads_active: false,
             recenter_count: 0,
             last_reaffirm_at: None,
+            last_motion_at: None,
             accumulator: ScaleAccumulator::default(),
             travel_since_down: 0,
         })
     }
 
-    /// Travel budget of one contact: a fraction of the smaller region
-    /// half-extent, so the contact can roam the whole clean region before it
-    /// is replaced.
+    /// Roam span of one contact: a fraction of the smaller region
+    /// half-extent. It no longer forces mid-stroke relocations; it scales
+    /// when the stillness recenter considers the contact worth replacing.
     fn travel_budget(&self) -> i64 {
         let half_width = (self.aim.region.right - self.aim.region.left) / 2;
         let half_height = (self.aim.region.bottom - self.aim.region.top) / 2;
         (u64::from(half_width.min(half_height))
             .saturating_mul(u64::from(self.settings.recenter_threshold_milli))
             / 1_000) as i64
+    }
+
+    /// Travel past which a stillness recenter may fire. A contact swap reads
+    /// to the game as a fresh look gesture, which costs rotation frames when
+    /// it lands mid-flick — precisely during sharp direction changes. Past
+    /// this soft budget the swap waits for true mouse stillness, where the
+    /// gesture restart is invisible because the camera stands still.
+    fn soft_travel_budget(&self) -> i64 {
+        self.travel_budget().saturating_mul(SOFT_RECENTER_MILLI) / 1_000
     }
 
     pub const fn aim(&self) -> &MouseAim {
@@ -456,6 +479,7 @@ impl MouseAimController {
         self.active_contact_id = Some(contact_id);
         self.next_contact_id = self.settings.alternate_contact_id;
         self.last_reaffirm_at = Some(now);
+        self.last_motion_at = Some(now);
         self.travel_since_down = 0;
         Ok(MouseAimUpdate::Activated)
     }
@@ -497,6 +521,7 @@ impl MouseAimController {
             // apply and no travel to budget.
             return Ok(MouseAimUpdate::Ignored);
         }
+        self.last_motion_at = Some(now);
         if let Some(pending) = &mut self.pending_recenter {
             trace_aim(format!(
                 "move during pending recenter: accumulate ({dx},{dy})"
@@ -519,13 +544,14 @@ impl MouseAimController {
         let target = self.aim.region.clamp(offset_point(current, dx, dy));
         let clamped = target == current;
 
-        // Relocate when the region edge swallowed the whole delta (the
-        // replacement lands at the origin, where later deltas apply again —
-        // without this the contact sticks to the edge and the camera dies
-        // for the rest of the swipe), or once the travel budget is spent.
-        // Both relocations continue from the new landing with the pending
-        // delta applied, so no rotation beyond the clamped event is lost.
-        if !clamped && self.travel_since_down < self.travel_budget() {
+        // Relocate only when the region edge actually swallowed the whole
+        // delta: the contact is pinned, and same-direction rotation is lost
+        // until it is replaced at the origin. Travel alone never forces a
+        // mid-stroke swap — every swap reads to the game as a fresh look
+        // gesture and costs rotation frames when it lands mid-flick, so the
+        // contact is traded during verified stillness instead (the
+        // stillness recenter in `tick`).
+        if !clamped {
             trace_aim(format!(
                 "move contact=({},{}) -> ({},{})",
                 current.x, current.y, target.x, target.y
@@ -537,7 +563,7 @@ impl MouseAimController {
         }
 
         trace_aim(format!(
-            "relocate contact=({},{}) budget={} clamped={clamped} delta=({dx},{dy})",
+            "edge relocate contact=({},{}) travel={} delta=({dx},{dy})",
             current.x, current.y, self.travel_since_down
         ));
         self.relocate(engine, contact_id, current, dx, dy, now)
@@ -564,6 +590,25 @@ impl MouseAimController {
             self.apply_residual(engine, pending.contact_id, pending.dx, pending.dy)?;
             self.travel_since_down = pending.dx.abs() + pending.dy.abs();
             return Ok(MouseAimUpdate::Recentered);
+        }
+
+        // Past the soft budget, trade the contact as soon as the mouse is
+        // verifiably still: the game rebinds its look gesture while the
+        // camera stands still, and the next stroke starts on a fresh touch
+        // with a full travel budget instead of swapping mid-flick.
+        if let Some(contact_id) = self.active_contact_id {
+            let still = self
+                .last_motion_at
+                .is_none_or(|last| now.saturating_sub(last) >= RECENTER_STILLNESS);
+            if still && self.travel_since_down >= self.soft_travel_budget() {
+                if let Some(position) = engine.state().position(contact_id) {
+                    trace_aim(format!(
+                        "stillness recenter contact=({},{}) travel={}",
+                        position.x, position.y, self.travel_since_down
+                    ));
+                    return self.relocate(engine, contact_id, position, 0, 0, now);
+                }
+            }
         }
 
         let Some(interval) = self.settings.reaffirm_interval else {
@@ -602,6 +647,7 @@ impl MouseAimController {
         }
         self.ads_active = false;
         self.last_reaffirm_at = None;
+        self.last_motion_at = None;
         self.accumulator.reset();
         self.travel_since_down = 0;
         Ok(if changed {
@@ -628,6 +674,7 @@ impl MouseAimController {
         }
         self.ads_active = false;
         self.last_reaffirm_at = None;
+        self.last_motion_at = None;
         self.accumulator.reset();
         self.travel_since_down = 0;
         Ok(changed)
@@ -1018,32 +1065,35 @@ mod tests {
         let mut engine = TouchEngine::new(RecordingInjector::default());
         controller.activate(&mut engine, Duration::ZERO).unwrap();
 
-        // Budget is 150 px of travel (half region height 300 x threshold
-        // 0.5): the first two moves stay on the same contact.
+        // Travel alone must not relocate: these moves cross the old budget
+        // many times over and still stay on the same contact.
         assert_eq!(
             controller
                 .move_by(
                     &mut engine,
-                    MouseAimDelta::new(100, 0),
+                    MouseAimDelta::new(400, 0),
                     Duration::from_millis(1)
                 )
                 .unwrap(),
             MouseAimUpdate::Moved
         );
+        // This move is partially swallowed by the right region edge: the
+        // overflow is lost, but the contact is not pinned yet.
         assert_eq!(
             controller
                 .move_by(
                     &mut engine,
-                    MouseAimDelta::new(100, 0),
+                    MouseAimDelta::new(300, 0),
                     Duration::from_millis(2)
                 )
                 .unwrap(),
             MouseAimUpdate::Moved
         );
+        assert_eq!(controller.recenter_count(), 0);
 
-        // The next move relocates: the replacement contact lands at the
-        // exact old position (zero rotation loss) and its same-frame move
-        // carries the pending delta, so the game rebinds immediately.
+        // The next move is fully swallowed: the contact is pinned at the
+        // edge, so it is replaced in one frame. The replacement lands at
+        // the origin and carries the pending delta as a same-frame move.
         assert_eq!(
             controller
                 .move_by(
@@ -1065,6 +1115,7 @@ mod tests {
         assert_eq!(recenter.events()[1].position, Point { x: 970, y: 540 });
         assert_eq!(recenter.events()[2].contact_id, ContactId::new(9));
         assert_eq!(recenter.events()[2].phase, TouchPhase::Up);
+        assert_eq!(recenter.events()[2].position, Point { x: 1600, y: 540 });
         assert_eq!(controller.recenter_count(), 1);
         assert!(engine.state().is_active(ContactId::new(10)));
         assert!(!engine.state().is_active(ContactId::new(9)));
@@ -1080,20 +1131,20 @@ mod tests {
         let mut engine = TouchEngine::new(RecordingInjector::default());
         controller.activate(&mut engine, Duration::ZERO).unwrap();
 
-        // Budget 150: this move stays on the active contact.
+        // This move is partially swallowed by the region edge but the
+        // contact is not pinned yet, so it stays on the old contact.
         assert_eq!(
             controller
                 .move_by(
                     &mut engine,
-                    MouseAimDelta::new(250, 0),
+                    MouseAimDelta::new(650, 0),
                     Duration::from_millis(1)
                 )
                 .unwrap(),
             MouseAimUpdate::Moved
         );
-        // Budget spent: with a recenter gap the old contact lifts now and
-        // the replacement presses after the gap, carrying the buffered
-        // delta.
+        // Pinned: with a recenter gap the old contact lifts now and the
+        // replacement presses after the gap, carrying the buffered delta.
         assert_eq!(
             controller
                 .move_by(
@@ -1116,6 +1167,213 @@ mod tests {
             engine.state().position(ContactId::new(10)),
             Some(Point { x: 970, y: 540 })
         );
+    }
+
+    #[test]
+    fn stillness_past_soft_budget_replaces_contact_between_strokes() {
+        let mut controller = controller(Duration::ZERO);
+        let mut engine = TouchEngine::new(RecordingInjector::default());
+        controller.activate(&mut engine, Duration::ZERO).unwrap();
+
+        // Budget is 150 px (threshold 0.5); the soft budget is half of it.
+        // This stroke pushes travel to 80, past the soft budget of 75.
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(80, 0),
+                    Duration::from_millis(1)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+        assert_eq!(controller.recenter_count(), 0);
+
+        // A quiet trailing event is motion, not stillness: the swap must
+        // not fire during the stroke's deceleration ramp — that is where
+        // the game eats a fresh touch's early motion.
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(1, 0),
+                    Duration::from_millis(6)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+        assert_eq!(
+            controller
+                .tick(&mut engine, Duration::from_millis(40))
+                .unwrap(),
+            MouseAimUpdate::Ignored
+        );
+
+        // Once the mouse has been verifiably still, the swap fires: the
+        // game rebinds its look gesture while the camera stands still, and
+        // the next stroke starts on a fresh contact.
+        assert_eq!(
+            controller
+                .tick(&mut engine, Duration::from_millis(50))
+                .unwrap(),
+            MouseAimUpdate::Recentered
+        );
+        let recenter = &engine.injector().frames[3];
+        assert_eq!(recenter.events().len(), 3);
+        assert_eq!(recenter.events()[0].phase, TouchPhase::Down);
+        assert_eq!(recenter.events()[0].position, Point { x: 960, y: 540 });
+        assert_eq!(recenter.events()[1].phase, TouchPhase::Move);
+        assert_eq!(recenter.events()[1].position, Point { x: 960, y: 540 });
+        assert_eq!(recenter.events()[2].phase, TouchPhase::Up);
+        assert_eq!(recenter.events()[2].position, Point { x: 1041, y: 540 });
+        assert_eq!(
+            engine.state().position(ContactId::new(10)),
+            Some(Point { x: 960, y: 540 })
+        );
+
+        // The replacement starts with a fresh budget: further motion stays
+        // on it instead of swapping again.
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(50, 0),
+                    Duration::from_millis(51)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+        assert_eq!(controller.recenter_count(), 1);
+        assert_eq!(
+            engine.state().position(ContactId::new(10)),
+            Some(Point { x: 1010, y: 540 })
+        );
+    }
+
+    #[test]
+    fn motion_resets_the_stillness_clock() {
+        let mut controller = controller(Duration::ZERO);
+        let mut engine = TouchEngine::new(RecordingInjector::default());
+        controller.activate(&mut engine, Duration::ZERO).unwrap();
+
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(90, 0),
+                    Duration::from_millis(1)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+        // Still for a while, but the clock restarts with every new motion.
+        assert_eq!(
+            controller
+                .tick(&mut engine, Duration::from_millis(30))
+                .unwrap(),
+            MouseAimUpdate::Ignored
+        );
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(3, 0),
+                    Duration::from_millis(35)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+        assert_eq!(
+            controller
+                .tick(&mut engine, Duration::from_millis(70))
+                .unwrap(),
+            MouseAimUpdate::Ignored
+        );
+        assert_eq!(controller.recenter_count(), 0);
+
+        assert_eq!(
+            controller
+                .tick(&mut engine, Duration::from_millis(80))
+                .unwrap(),
+            MouseAimUpdate::Recentered
+        );
+        assert_eq!(controller.recenter_count(), 1);
+    }
+
+    #[test]
+    fn motion_below_soft_budget_never_replaces_contact() {
+        let mut controller = controller(Duration::ZERO);
+        let mut engine = TouchEngine::new(RecordingInjector::default());
+        controller.activate(&mut engine, Duration::ZERO).unwrap();
+
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(50, 0),
+                    Duration::from_millis(1)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+        assert_eq!(
+            controller
+                .tick(&mut engine, Duration::from_millis(200))
+                .unwrap(),
+            MouseAimUpdate::Reaffirmed
+        );
+
+        // Below the soft budget even true stillness keeps the contact.
+        assert_eq!(controller.recenter_count(), 0);
+        assert!(engine.state().is_active(ContactId::new(9)));
+    }
+
+    #[test]
+    fn loud_motion_keeps_contact_until_region_edge() {
+        let mut controller = controller(Duration::ZERO);
+        let mut engine = TouchEngine::new(RecordingInjector::default());
+        controller.activate(&mut engine, Duration::ZERO).unwrap();
+
+        // Loud strokes past the soft budget must never swap mid-flick.
+        for tick in 1..=5 {
+            assert_eq!(
+                controller
+                    .move_by(
+                        &mut engine,
+                        MouseAimDelta::new(35, 0),
+                        Duration::from_millis(tick)
+                    )
+                    .unwrap(),
+                MouseAimUpdate::Moved
+            );
+        }
+        assert_eq!(controller.recenter_count(), 0);
+        assert!(engine.state().is_active(ContactId::new(9)));
+
+        // A big stroke rides into the edge (partial clamp keeps moving),
+        // and only a fully swallowed delta pins the contact into a swap.
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(700, 0),
+                    Duration::from_millis(6)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+        assert_eq!(controller.recenter_count(), 0);
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(10, 0),
+                    Duration::from_millis(7)
+                )
+                .unwrap(),
+            MouseAimUpdate::Recentered
+        );
+        assert_eq!(controller.recenter_count(), 1);
     }
 
     #[test]
