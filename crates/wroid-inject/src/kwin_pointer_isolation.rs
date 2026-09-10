@@ -20,6 +20,10 @@ use dbus::blocking::Connection;
 const KWIN_SERVICE: &str = "org.kde.KWin";
 const KWIN_INPUT_INTERFACE: &str = "org.kde.KWin.InputDevice";
 const DBUS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Set+verify is retried once: two attempts × two DBus calls × DBUS_TIMEOUT
+/// stays inside the 10 s `INPUT_CONTROL_TIMEOUT` that bounds the whole
+/// mouse-mode control round trip.
+const KWIN_SET_ATTEMPTS: usize = 1;
 const DEVICE_DISCOVERY_ATTEMPTS: usize = 40;
 const DEVICE_DISCOVERY_INTERVAL: Duration = Duration::from_millis(50);
 const RESTORE_WATCHDOG_SCRIPT: &str = r#"
@@ -119,6 +123,12 @@ impl KwinInputIsolation {
     }
 
     /// Exclude/include the physical pointer from KWin and verify the result.
+    ///
+    /// The DBus round trip is retried once: KWin under fullscreen game load
+    /// regularly loses a reply outright ("Did not receive a reply"), and a
+    /// single transient failure here aborts the whole game session through
+    /// the mouse-mode control path. Worst case (four lost calls) stays
+    /// inside `INPUT_CONTROL_TIMEOUT`.
     pub(crate) fn set_isolated(&mut self, isolated: bool) -> io::Result<()> {
         if isolated == self.isolated {
             return Ok(());
@@ -137,52 +147,64 @@ impl KwinInputIsolation {
                 self.original_enabled,
             )?);
         }
-        let proxy =
-            self.connection
-                .with_proxy(KWIN_SERVICE, self.object_path.as_str(), DBUS_TIMEOUT);
-        let update = proxy
-            .set(KWIN_INPUT_INTERFACE, "enabled", enabled)
-            .map_err(|error| {
-                kwin_error(&self.sys_name, self.capability, "set enabled state", error)
-            })
-            .and_then(|()| {
-                let actual: bool = proxy
-                    .get(KWIN_INPUT_INTERFACE, "enabled")
-                    .map_err(|error| {
-                        kwin_error(
-                            &self.sys_name,
-                            self.capability,
-                            "verify enabled state",
-                            error,
-                        )
-                    })?;
-                if actual != enabled {
-                    return Err(io::Error::other(format!(
-                        "KWin {} {} stayed enabled={actual}, expected {enabled}",
+
+        let mut last_error: Option<io::Error> = None;
+        for attempt in 0..=KWIN_SET_ATTEMPTS {
+            let proxy =
+                self.connection
+                    .with_proxy(KWIN_SERVICE, self.object_path.as_str(), DBUS_TIMEOUT);
+            let update = proxy
+                .set(KWIN_INPUT_INTERFACE, "enabled", enabled)
+                .map_err(|error| {
+                    kwin_error(&self.sys_name, self.capability, "set enabled state", error)
+                })
+                .and_then(|()| {
+                    let actual: bool =
+                        proxy
+                            .get(KWIN_INPUT_INTERFACE, "enabled")
+                            .map_err(|error| {
+                                kwin_error(
+                                    &self.sys_name,
+                                    self.capability,
+                                    "verify enabled state",
+                                    error,
+                                )
+                            })?;
+                    if actual != enabled {
+                        return Err(io::Error::other(format!(
+                            "KWin {} {} stayed enabled={actual}, expected {enabled}",
+                            self.capability.label(),
+                            self.sys_name
+                        )));
+                    }
+                    Ok(())
+                });
+            match update {
+                Ok(()) => {
+                    self.isolated = isolated;
+                    if !isolated {
+                        self.stop_watchdog()?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    println!(
+                        "[kwin-isolation] {} {} set attempt {attempt} failed: {error}",
                         self.capability.label(),
                         self.sys_name
-                    )));
+                    );
+                    last_error = Some(error);
                 }
-                Ok(())
-            });
+            }
+        }
 
-        match update {
-            Ok(()) => {
-                self.isolated = isolated;
-                if !isolated {
-                    self.stop_watchdog()?;
-                }
-                Ok(())
-            }
-            Err(error) => {
-                let watchdog_error = self.stop_watchdog().err();
-                match watchdog_error {
-                    Some(watchdog) => Err(io::Error::other(format!(
-                        "{error}; pointer restore watchdog also failed: {watchdog}"
-                    ))),
-                    None => Err(error),
-                }
-            }
+        let error = last_error.unwrap_or_else(|| io::Error::other("KWin set failed"));
+        let watchdog_error = self.stop_watchdog().err();
+        match watchdog_error {
+            Some(watchdog) => Err(io::Error::other(format!(
+                "{error}; pointer restore watchdog also failed: {watchdog}"
+            ))),
+            None => Err(error),
         }
     }
 

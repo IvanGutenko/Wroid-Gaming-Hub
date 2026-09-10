@@ -91,10 +91,11 @@ fn reload_profile_if_changed<I: TouchInjector>(
 
 /// Reply deadline for input-reader control commands. The mouse mode path
 /// runs a KWin DBus pair (set + verify get, each bounded by `DBUS_TIMEOUT`)
-/// plus an isolation watchdog spawn inside the reader, so the deadline must
-/// exceed that worst case instead of racing it: a timed-out control aborts
-/// the whole game session, which is worse than a slow capture toggle.
-const INPUT_CONTROL_TIMEOUT: Duration = Duration::from_secs(8);
+/// with one full retry plus an isolation watchdog spawn inside the reader,
+/// so the deadline must exceed that worst case (4 × 2 s + margin) instead of
+/// racing it: a timed-out control aborts the whole game session, which is
+/// worse than a slow capture toggle.
+const INPUT_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const FOCUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Short socket read slices let the focus handshake tolerate a delayed KWin
 /// callback without surfacing the intermediate EAGAIN as a permanent failure.
