@@ -566,6 +566,11 @@ impl MouseAimController {
             "edge relocate contact=({},{}) travel={} delta=({dx},{dy})",
             current.x, current.y, self.travel_since_down
         ));
+        // The replacement presses at the origin: the one landing point
+        // proven to sit inside the game's look zone. Edge landing points
+        // further out look attractive for travel budget, but Standoff 2
+        // stops binding the look gesture below ~45% of screen width — a
+        // down event there silently kills that whole direction.
         self.relocate(engine, contact_id, current, dx, dy, now)
     }
 
@@ -694,12 +699,10 @@ impl MouseAimController {
 
     /// Replace the active contact without losing rotation.
     ///
-    /// `clamped` relocations land the replacement at the origin so the edge-
-    /// swallowed delta becomes applicable again; budget relocations land at
-    /// the exact position of the old contact, which keeps the game's
-    /// per-touch position samples continuous (zero rotation loss). Both
-    /// variants carry the pending delta as a same-frame move so the game
-    /// rebinds its look gesture immediately.
+    /// The replacement presses at the origin — the one landing point proven
+    /// to sit inside the game's look zone — and carries the pending delta
+    /// as a same-frame move, so the game rebinds its look gesture
+    /// immediately and the travel budget resets.
     #[allow(clippy::too_many_arguments)]
     fn relocate<I: TouchInjector>(
         &mut self,
@@ -713,12 +716,6 @@ impl MouseAimController {
         let new_contact_id = self.next_contact_id;
 
         if self.settings.recenter_gap.is_zero() {
-            // The replacement always lands at the origin: the one point of
-            // the region guaranteed clear of HUD buttons. Landing on the old
-            // contact's exact position stacks two touches on one spot for a
-            // frame, which games read as a broken gesture. The pending delta
-            // rides along as a same-frame move so the game rebinds its look
-            // gesture immediately.
             let landed = self.aim.region.clamp(offset_point(self.aim.origin, dx, dy));
             engine.submit(TouchFrame::new([
                 TouchEvent::new(new_contact_id, TouchPhase::Down, self.aim.origin),
