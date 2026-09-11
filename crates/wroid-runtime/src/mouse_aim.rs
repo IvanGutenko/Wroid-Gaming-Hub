@@ -542,15 +542,20 @@ impl MouseAimController {
             return Ok(MouseAimUpdate::Ignored);
         };
         let target = self.aim.region.clamp(offset_point(current, dx, dy));
-        let clamped = target == current;
+        // Relocate when any axis was fully swallowed by the edge. Both-axes
+        // (the classic full clamp) is not enough: in a diagonal drag one
+        // axis pins first and the contact then slides along the edge, so
+        // that axis silently loses rotation for the rest of the stroke
+        // while the other keeps it alive and no full clamp ever fires.
+        let clamped = (dx != 0 && target.x == current.x) || (dy != 0 && target.y == current.y);
 
-        // Relocate only when the region edge actually swallowed the whole
-        // delta: the contact is pinned, and same-direction rotation is lost
-        // until it is replaced at the origin. Travel alone never forces a
-        // mid-stroke swap — every swap reads to the game as a fresh look
-        // gesture and costs rotation frames when it lands mid-flick, so the
-        // contact is traded during verified stillness instead (the
-        // stillness recenter in `tick`).
+        // Relocate only when the region edge actually swallowed the delta
+        // on some axis: the contact is pinned on that axis, and same-
+        // direction rotation there is lost until it is replaced at the
+        // origin. Travel alone never forces a mid-stroke swap — every swap
+        // reads to the game as a fresh look gesture and costs rotation
+        // frames when it lands mid-flick, so the contact is traded during
+        // verified stillness instead (the stillness recenter in `tick`).
         if !clamped {
             trace_aim(format!(
                 "move contact=({},{}) -> ({},{})",
@@ -759,9 +764,22 @@ impl MouseAimController {
 }
 
 fn trace_aim(message: String) {
-    if std::env::var_os("WROID_AIM_TRACE").is_some() {
-        eprintln!("[aim-trace] {message}");
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var_os("WROID_AIM_TRACE").is_some()
+            || std::env::var_os("HOME").is_some_and(|home| {
+                std::path::Path::new(&home)
+                    .join(".local/state/wroid/aim-trace")
+                    .exists()
+            })
+    }) {
+        return;
     }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    eprintln!("[aim-trace {millis}] {message}");
 }
 
 fn offset_point(point: Point, dx: i64, dy: i64) -> Point {
@@ -1120,6 +1138,49 @@ mod tests {
             engine.state().position(ContactId::new(10)),
             Some(Point { x: 970, y: 540 })
         );
+    }
+
+    #[test]
+    fn diagonal_drag_relocates_when_one_axis_pins_at_the_edge() {
+        let mut controller = controller(Duration::ZERO);
+        let mut engine = TouchEngine::new(RecordingInjector::default());
+        controller.activate(&mut engine, Duration::ZERO).unwrap();
+
+        // A vertical stroke rides into the bottom edge (partial clamp on
+        // the overshoot) but is not pinned yet.
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(0, 400),
+                    Duration::from_millis(1)
+                )
+                .unwrap(),
+            MouseAimUpdate::Moved
+        );
+        assert_eq!(controller.recenter_count(), 0);
+
+        // Pinned: every further event would slide along the edge with the
+        // vertical rotation silently dead. The relocation must fire on the
+        // single pinned axis instead of waiting for a both-axes clamp that
+        // never comes while the other axis keeps moving.
+        assert_eq!(
+            controller
+                .move_by(
+                    &mut engine,
+                    MouseAimDelta::new(0, 10),
+                    Duration::from_millis(2)
+                )
+                .unwrap(),
+            MouseAimUpdate::Recentered
+        );
+        let recenter = &engine.injector().frames[2];
+        assert_eq!(recenter.events()[0].phase, TouchPhase::Down);
+        assert_eq!(recenter.events()[0].position, Point { x: 960, y: 540 });
+        assert_eq!(recenter.events()[1].phase, TouchPhase::Move);
+        assert_eq!(recenter.events()[1].position, Point { x: 960, y: 550 });
+        assert_eq!(recenter.events()[2].phase, TouchPhase::Up);
+        assert_eq!(recenter.events()[2].position, Point { x: 960, y: 840 });
     }
 
     #[test]
